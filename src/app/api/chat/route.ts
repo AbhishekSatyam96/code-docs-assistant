@@ -7,7 +7,8 @@ import { ask, type AnswerEvent } from "@/lib/llm/answer";
 import { logger } from "@/lib/observability/logger";
 
 export const dynamic = "force-dynamic";
-// Streaming needs the Node runtime: better-sqlite3 is a native module.
+// The Node runtime, not Edge: `pg` opens a TCP socket to Postgres, which the
+// Edge runtime cannot do.
 export const runtime = "nodejs";
 
 const Body = z.object({

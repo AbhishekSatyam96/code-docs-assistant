@@ -5,10 +5,11 @@ const nextConfig: NextConfig = {
   // production Docker image small (no full node_modules copy).
   output: "standalone",
 
-  // Native/loadable-extension modules must be `require`d at runtime rather
-  // than bundled. `better-sqlite3` is on Next's built-in list; `sqlite-vec`
-  // resolves a platform-specific `.dylib`/`.so` and has to be added here.
-  serverExternalPackages: ["better-sqlite3", "sqlite-vec"],
+  // `pg` is CommonJS and does `class Pool extends require("pg-pool")`. Bundled,
+  // that require can resolve to an ES module namespace object, and extending
+  // one throws at import time. Keeping it external hands it to Node's own
+  // loader. The test runner needs the same treatment — see vitest.config.mts.
+  serverExternalPackages: ["pg"],
 };
 
 export default nextConfig;

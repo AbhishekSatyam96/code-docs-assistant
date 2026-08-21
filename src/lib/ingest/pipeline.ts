@@ -1,8 +1,9 @@
 import "server-only";
 
 import { nanoid } from "nanoid";
+import type { PoolClient } from "pg";
 
-import { getDb, toVectorBlob, type DB } from "@/lib/db";
+import { query, tbl, toVectorLiteral, transaction } from "@/lib/db";
 import { embedTexts } from "@/lib/embeddings";
 import { logger } from "@/lib/observability/logger";
 import { chunkFile, type CodeChunk } from "./chunker";
@@ -22,19 +23,6 @@ export interface StartIngestionInput {
   files?: Array<{ path: string; content: string }>;
 }
 
-/**
- * Create the repository row and kick off indexing.
- *
- * Indexing runs detached rather than awaited: a mid-size repo takes 30-90
- * seconds, which is far past any sensible HTTP timeout, and holding the
- * request open gives the user a spinner with no detail. Instead the row is
- * created immediately in `queued` state and progress is written to the same
- * row as work proceeds, so the client can poll a real percentage.
- *
- * This is the single biggest thing I'd change for production — see the README:
- * an in-process background task dies with the process and cannot be retried or
- * observed across replicas. It wants a real queue.
- */
 export interface StartedIngestion {
   id: string;
   /**
@@ -45,8 +33,24 @@ export interface StartedIngestion {
   done: Promise<void>;
 }
 
-export function startIngestion(input: StartIngestionInput): StartedIngestion {
-  const db = getDb();
+/**
+ * Create the repository row and kick off indexing.
+ *
+ * Indexing runs detached rather than awaited: a mid-size repo takes 30-90
+ * seconds, far past any sensible HTTP timeout, and holding the request open
+ * gives the user a spinner with no detail. The row is created immediately in
+ * `queued` state and progress is written to it as work proceeds, so the client
+ * can poll a real percentage.
+ *
+ * This is the single biggest thing to change for production — see the README.
+ * An in-process background task dies with the process, cannot be retried, and
+ * cannot be observed across replicas. On a serverless host it is worse than
+ * that: the instance is frozen once the response is sent, so indexing would be
+ * killed mid-flight. It wants a real queue.
+ */
+export async function startIngestion(
+  input: StartIngestionInput,
+): Promise<StartedIngestion> {
   const id = nanoid(12);
   const now = Date.now();
 
@@ -55,55 +59,46 @@ export function startIngestion(input: StartIngestionInput): StartedIngestion {
       ? input.sourceRef.replace(/^https?:\/\/(www\.)?github\.com\//, "").replace(/\/$/, "")
       : input.sourceRef;
 
-  db.prepare(
-    `INSERT INTO repositories (id, name, source_type, source_ref, status, status_detail, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', 'Queued', ?, ?)`,
-  ).run(id, displayName, input.sourceType, input.sourceRef, now, now);
+  await query(
+    `INSERT INTO ${tbl("repositories")}
+       (id, name, source_type, source_ref, status, status_detail, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'queued', 'Queued', $5, $6)`,
+    [id, displayName, input.sourceType, input.sourceRef, now, now],
+  );
 
-  const done = runIngestion(id, input).catch((error) => {
+  const done = runIngestion(id, input).catch(async (error) => {
     logger.error("ingestion failed", error, { repoId: id });
     const message =
       error instanceof IngestError
         ? error.message
         : "Indexing failed unexpectedly. Check server logs.";
-    markFailed(db, id, message);
+    await markFailed(id, message);
   });
 
   return { id, done };
 }
 
 async function runIngestion(repoId: string, input: StartIngestionInput): Promise<void> {
-  const db = getDb();
   const log = logger.bind({ repoId });
   const started = performance.now();
 
-  setStatus(db, repoId, "indexing", "Downloading source", 0.02);
+  await setStatus(repoId, "indexing", "Downloading source", 0.02);
 
   const source: LoadedSource =
     input.sourceType === "github"
       ? await loadGitHubRepo(input.sourceRef)
       : loadUploadedFiles(input.sourceRef, input.files ?? []);
 
-  setStatus(db, repoId, "indexing", `Chunking ${source.files.length} files`, 0.12);
+  await setStatus(repoId, "indexing", `Chunking ${source.files.length} files`, 0.12);
 
   // ---- Files + chunks -----------------------------------------------------
-  const insertFile = db.prepare(
-    `INSERT INTO files (repo_id, path, language, bytes, loc, content) VALUES (?, ?, ?, ?, ?, ?)`,
-  );
-  const insertChunk = db.prepare(
-    `INSERT INTO chunks (repo_id, file_id, ordinal, start_line, end_line, symbol, kind, token_count, content, embed_text)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-
   interface PendingChunk {
     id: number;
     embedText: string;
   }
   const pending: PendingChunk[] = [];
 
-  // One transaction for all metadata: better-sqlite3 is synchronous, and
-  // committing per row would fsync thousands of times.
-  const writeAll = db.transaction(() => {
+  await transaction(async (client) => {
     for (const file of source.files) {
       const spec = detectLanguage(file.path);
       if (!spec) continue;
@@ -111,46 +106,31 @@ async function runIngestion(repoId: string, input: StartIngestionInput): Promise
       const chunks: CodeChunk[] = chunkFile(file.path, file.content);
       if (chunks.length === 0) continue;
 
-      const fileResult = insertFile.run(
-        repoId,
-        file.path,
-        spec.language,
-        file.bytes,
-        file.content.split("\n").length,
-        file.content,
-      );
-      const fileId = Number(fileResult.lastInsertRowid);
-
-      for (const chunk of chunks) {
-        const chunkResult = insertChunk.run(
+      const fileResult = await client.query<{ id: string }>(
+        `INSERT INTO ${tbl("files")} (repo_id, path, language, bytes, loc, content)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [
           repoId,
-          fileId,
-          chunk.ordinal,
-          chunk.startLine,
-          chunk.endLine,
-          chunk.symbol,
-          chunk.kind,
-          chunk.tokenCount,
-          chunk.content,
-          chunk.embedText,
-        );
-        pending.push({
-          id: Number(chunkResult.lastInsertRowid),
-          embedText: chunk.embedText,
-        });
-      }
+          file.path,
+          spec.language,
+          file.bytes,
+          file.content.split("\n").length,
+          file.content,
+        ],
+      );
+      const fileId = Number(fileResult.rows[0].id);
+
+      const ids = await insertChunkBatch(client, repoId, fileId, chunks);
+      chunks.forEach((chunk, index) => {
+        pending.push({ id: ids[index], embedText: chunk.embedText });
+      });
     }
   });
-  writeAll();
 
   log.info("chunked", { files: source.files.length, chunks: pending.length });
-  setStatus(db, repoId, "indexing", `Embedding ${pending.length} chunks`, 0.2);
+  await setStatus(repoId, "indexing", `Embedding ${pending.length} chunks`, 0.2);
 
   // ---- Embeddings ---------------------------------------------------------
-  const insertVector = db.prepare(
-    `INSERT INTO chunk_vectors (chunk_id, repo_id, embedding) VALUES (?, ?, ?)`,
-  );
-
   const EMBED_WINDOW = 384; // ~4 API batches per progress tick
   let embedTokens = 0;
 
@@ -159,17 +139,12 @@ async function runIngestion(repoId: string, input: StartIngestionInput): Promise
     const { vectors, tokens } = await embedTexts(window.map((c) => c.embedText));
     embedTokens += tokens;
 
-    db.transaction(() => {
-      for (let i = 0; i < window.length; i++) {
-        // vec0 requires an INTEGER rowid; better-sqlite3 binds plain JS
-        // numbers as REAL, which the extension rejects. BigInt forces INTEGER.
-        insertVector.run(BigInt(window[i].id), repoId, toVectorBlob(vectors[i]));
-      }
-    })();
+    await writeEmbeddings(
+      window.map((chunk, index) => ({ id: chunk.id, vector: vectors[index] })),
+    );
 
     const done = Math.min(offset + window.length, pending.length);
-    setStatus(
-      db,
+    await setStatus(
       repoId,
       "indexing",
       `Embedded ${done} / ${pending.length} chunks`,
@@ -178,23 +153,25 @@ async function runIngestion(repoId: string, input: StartIngestionInput): Promise
   }
 
   // ---- Repo map -----------------------------------------------------------
-  setStatus(db, repoId, "indexing", "Analysing structure", 0.97);
+  await setStatus(repoId, "indexing", "Analysing structure", 0.97);
   const repoMap = buildRepoMap(source.files);
 
-  db.prepare(
-    `UPDATE repositories
-     SET status = 'ready', status_detail = ?, progress = 1, commit_ref = ?,
-         file_count = ?, chunk_count = ?, embed_tokens = ?, repo_map = ?, updated_at = ?
-     WHERE id = ?`,
-  ).run(
-    `Indexed ${source.files.length} files`,
-    source.ref,
-    source.files.length,
-    pending.length,
-    embedTokens,
-    JSON.stringify(repoMap),
-    Date.now(),
-    repoId,
+  await query(
+    `UPDATE ${tbl("repositories")}
+        SET status = 'ready', status_detail = $1, progress = 1, commit_ref = $2,
+            file_count = $3, chunk_count = $4, embed_tokens = $5,
+            repo_map = $6::jsonb, updated_at = $7
+      WHERE id = $8`,
+    [
+      `Indexed ${source.files.length} files`,
+      source.ref,
+      source.files.length,
+      pending.length,
+      embedTokens,
+      JSON.stringify(repoMap),
+      Date.now(),
+      repoId,
+    ],
   );
 
   log.info("ingestion complete", {
@@ -206,34 +183,124 @@ async function runIngestion(repoId: string, input: StartIngestionInput): Promise
   });
 }
 
-function setStatus(
-  db: DB,
+/**
+ * Insert a file's chunks in one statement.
+ *
+ * The SQLite version could afford a prepared statement per row because it was
+ * an in-process function call. Against a hosted database that is one network
+ * round trip per chunk — on a 3,000-chunk repo, tens of thousands of
+ * milliseconds spent entirely on latency. A multi-row VALUES list collapses it
+ * to one round trip per file, and `RETURNING id` preserves the mapping from
+ * row back to chunk so the embedding step knows what to attach where.
+ */
+async function insertChunkBatch(
+  client: PoolClient,
+  repoId: string,
+  fileId: number,
+  chunks: CodeChunk[],
+): Promise<number[]> {
+  const COLUMNS = 10;
+  const params: unknown[] = [];
+  const rows: string[] = [];
+
+  chunks.forEach((chunk, index) => {
+    const base = index * COLUMNS;
+    rows.push(
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, ` +
+        `$${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`,
+    );
+    params.push(
+      repoId,
+      fileId,
+      chunk.ordinal,
+      chunk.startLine,
+      chunk.endLine,
+      chunk.symbol,
+      chunk.kind,
+      chunk.tokenCount,
+      chunk.content,
+      chunk.embedText,
+    );
+  });
+
+  const result = await client.query<{ id: string }>(
+    `INSERT INTO ${tbl("chunks")}
+       (repo_id, file_id, ordinal, start_line, end_line, symbol, kind, token_count, content, embed_text)
+     VALUES ${rows.join(", ")}
+     RETURNING id`,
+    params,
+  );
+
+  // Postgres returns RETURNING rows in insertion order for a multi-row VALUES
+  // list, which is what lets us zip these back onto `chunks` by position.
+  return result.rows.map((row) => Number(row.id));
+}
+
+/**
+ * Attach embeddings to already-inserted chunks.
+ *
+ * `UPDATE ... FROM (VALUES ...)` rather than one UPDATE per chunk, for the same
+ * round-trip reason as the insert above. The vectors are passed as bind
+ * parameters and cast, never interpolated.
+ */
+async function writeEmbeddings(
+  entries: Array<{ id: number; vector: number[] }>,
+): Promise<void> {
+  if (entries.length === 0) return;
+
+  const params: unknown[] = [];
+  const rows: string[] = [];
+
+  entries.forEach((entry, index) => {
+    const base = index * 2;
+    rows.push(`($${base + 1}::bigint, $${base + 2}::vector)`);
+    params.push(entry.id, toVectorLiteral(entry.vector));
+  });
+
+  await query(
+    `UPDATE ${tbl("chunks")} AS c
+        SET embedding = v.embedding
+       FROM (VALUES ${rows.join(", ")}) AS v(id, embedding)
+      WHERE c.id = v.id`,
+    params,
+  );
+}
+
+async function setStatus(
   repoId: string,
   status: string,
   detail: string,
   progress: number,
-) {
-  db.prepare(
-    `UPDATE repositories SET status = ?, status_detail = ?, progress = ?, updated_at = ? WHERE id = ?`,
-  ).run(status, detail, progress, Date.now(), repoId);
+): Promise<void> {
+  await query(
+    `UPDATE ${tbl("repositories")}
+        SET status = $1, status_detail = $2, progress = $3, updated_at = $4
+      WHERE id = $5`,
+    [status, detail, progress, Date.now(), repoId],
+  );
 }
 
-function markFailed(db: DB, repoId: string, detail: string) {
+async function markFailed(repoId: string, detail: string): Promise<void> {
   try {
-    db.prepare(
-      `UPDATE repositories SET status = 'failed', status_detail = ?, updated_at = ? WHERE id = ?`,
-    ).run(detail, Date.now(), repoId);
+    await query(
+      `UPDATE ${tbl("repositories")}
+          SET status = 'failed', status_detail = $1, updated_at = $2
+        WHERE id = $3`,
+      [detail, Date.now(), repoId],
+    );
   } catch (error) {
     logger.error("could not mark repository failed", error, { repoId });
   }
 }
 
-export function deleteRepository(repoId: string): void {
-  const db = getDb();
-  db.transaction(() => {
-    // chunk_vectors is a virtual table, so ON DELETE CASCADE does not reach it.
-    db.prepare("DELETE FROM chunk_vectors WHERE repo_id = ?").run(repoId);
-    db.prepare("DELETE FROM repositories WHERE id = ?").run(repoId);
-  })();
+/**
+ * Delete a repository and everything under it.
+ *
+ * Unlike the SQLite version this needs no manual vector cleanup: embeddings
+ * are a column on `chunks` rather than a separate virtual table, so the
+ * existing `ON DELETE CASCADE` reaches them.
+ */
+export async function deleteRepository(repoId: string): Promise<void> {
+  await query(`DELETE FROM ${tbl("repositories")} WHERE id = $1`, [repoId]);
   logger.info("repository deleted", { repoId });
 }

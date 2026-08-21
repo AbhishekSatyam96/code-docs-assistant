@@ -1,111 +1,183 @@
 import "server-only";
 
-import fs from "node:fs";
-import path from "node:path";
-import Database from "better-sqlite3";
-import * as sqliteVec from "sqlite-vec";
+import { Pool, type PoolClient, type QueryResultRow } from "pg";
 
 import { embeddingDimensions, env } from "@/lib/config";
 import { logger } from "@/lib/observability/logger";
-import { SCHEMA_SQL } from "./schema";
-
-export type DB = Database.Database;
-
-let instance: DB | null = null;
+import { schemaSql } from "./schema";
 
 /**
- * Process-wide singleton. Next.js dev mode re-evaluates modules on every hot
- * reload, so the handle is parked on `globalThis` to avoid leaking file
- * descriptors and re-running migrations on every save.
+ * Postgres connection pool.
+ *
+ * ## Pool sizing is a deployment concern
+ * Every serverless instance builds its own pool, and node-postgres defaults
+ * `max` to 10 — which quietly reserves ten connections per instance for
+ * sockets that are idle almost all the time. Three is plenty here: requests in
+ * this app spend seconds waiting on OpenAI and milliseconds waiting on
+ * Postgres, so concurrency is bounded by the model, not the database.
+ *
+ * This is only safe against Neon's **pooled** endpoint (host contains
+ * `-pooler`). The direct endpoint has a hard connection ceiling that
+ * N instances x 3 will find.
+ *
+ * `connectionTimeoutMillis` matters more than it looks: the default is 0,
+ * meaning "wait forever" for a free connection. On a metered function that is
+ * a request which bills for its whole duration and then times out with nothing
+ * to show. Fail fast instead.
  */
-const GLOBAL_KEY = Symbol.for("code-docs-assistant.db");
-type GlobalWithDb = typeof globalThis & { [GLOBAL_KEY]?: DB };
+const GLOBAL_KEY = Symbol.for("code-docs-assistant.pg");
+type GlobalWithPool = typeof globalThis & {
+  [GLOBAL_KEY]?: { pool: Pool; ready: Promise<void> };
+};
 
-export function getDb(): DB {
-  if (instance) return instance;
-
-  const cached = (globalThis as GlobalWithDb)[GLOBAL_KEY];
-  if (cached) {
-    instance = cached;
-    return instance;
-  }
-
-  const dbPath = env().DATABASE_PATH;
-  fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
-
-  const db = new Database(dbPath);
-
-  // WAL lets the ingestion writer and query readers proceed concurrently,
-  // which matters because indexing runs in the background while the user is
-  // already asking questions about an earlier repo.
-  db.pragma("journal_mode = WAL");
-  db.pragma("synchronous = NORMAL");
-  db.pragma("foreign_keys = ON");
-  db.pragma("busy_timeout = 5000");
-
-  sqliteVec.load(db);
-  db.exec(SCHEMA_SQL);
-  ensureVectorTable(db);
-
-  logger.info("database ready", {
-    path: dbPath,
-    sqliteVec: (db.prepare("select vec_version() as v").get() as { v: string }).v,
+function createPool(): Pool {
+  const pool = new Pool({
+    connectionString: env().DATABASE_URL,
+    max: 3,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 30_000,
+    // Neon requires TLS. `pg` will not enable it from the URL alone unless
+    // sslmode is present, so this is belt and braces for both forms.
+    ssl: env().DATABASE_URL.includes("localhost") ? undefined : { rejectUnauthorized: true },
   });
 
-  instance = db;
-  (globalThis as GlobalWithDb)[GLOBAL_KEY] = db;
-  return db;
+  // NOTE: deliberately no `pool.on("connect")` session setup.
+  //
+  // The obvious place to run `SET search_path` and the HNSW tuning is a connect
+  // handler, and it is wrong: `connect` is a plain event, so the pool cannot
+  // await it. It hands the client to the caller while those statements are
+  // still in flight, which node-postgres reports as "Calling client.query()
+  // when the client is already executing a query" — deprecated today, an error
+  // in pg 9.
+  //
+  // Neither setting is needed there anyway:
+  //   * search_path — every table reference goes through `tbl()`, which is
+  //     schema-qualified, and the `vector` type lives in `public`, which is on
+  //     the default search path already.
+  //   * hnsw.*      — scoped to the one query that needs it, with `SET LOCAL`
+  //     inside a transaction. See `retrieval/index.ts`.
+
+  // An idle client erroring (Neon scaling to zero, a network blip) emits on the
+  // pool. Unhandled, it takes the process down.
+  pool.on("error", (error) => {
+    logger.error("idle postgres client error", error);
+  });
+
+  return pool;
 }
 
 /**
- * The vector table is created here rather than in SCHEMA_SQL because its
- * dimensionality depends on the configured embedding model.
+ * Returns a pool with the schema guaranteed to exist.
  *
- * If the configured model changes, the existing index is meaningless — vectors
- * from different models are not comparable — so we drop and rebuild rather
- * than silently returning nonsense neighbours. Repos then need re-indexing,
- * which is the honest outcome; `dimensions` is recorded to detect the change.
+ * Bootstrapping is memoised as a promise rather than a boolean so that N
+ * concurrent first-requests await one migration instead of racing to run it
+ * N times.
  */
-function ensureVectorTable(db: DB) {
-  const dims = embeddingDimensions(env().OPENAI_EMBEDDING_MODEL);
+export function getDb(): Promise<Pool> {
+  const cached = (globalThis as GlobalWithPool)[GLOBAL_KEY];
+  if (cached) return cached.ready.then(() => cached.pool);
 
-  db.exec(`CREATE TABLE IF NOT EXISTS vector_meta (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    model TEXT NOT NULL,
-    dimensions INTEGER NOT NULL
-  )`);
-
-  const meta = db
-    .prepare("SELECT model, dimensions FROM vector_meta WHERE id = 1")
-    .get() as { model: string; dimensions: number } | undefined;
-
-  if (meta && meta.dimensions !== dims) {
-    logger.warn("embedding model changed — rebuilding vector index", {
-      from: meta.model,
-      to: env().OPENAI_EMBEDDING_MODEL,
-    });
-    db.exec("DROP TABLE IF EXISTS chunk_vectors");
-    db.exec("DELETE FROM chunks");
-    db.exec("UPDATE repositories SET status = 'failed', status_detail = 'Embedding model changed — re-index required'");
-  }
-
-  // `repo_id` as a partition key means KNN is evaluated inside a single repo's
-  // vectors instead of globally, so one large repo can't crowd out results
-  // from the repo the user is actually asking about.
-  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(
-    chunk_id INTEGER PRIMARY KEY,
-    repo_id TEXT PARTITION KEY,
-    embedding FLOAT[${dims}] DISTANCE_METRIC=cosine
-  )`);
-
-  db.prepare(
-    "INSERT INTO vector_meta (id, model, dimensions) VALUES (1, ?, ?) " +
-      "ON CONFLICT(id) DO UPDATE SET model = excluded.model, dimensions = excluded.dimensions",
-  ).run(env().OPENAI_EMBEDDING_MODEL, dims);
+  const pool = createPool();
+  const ready = bootstrap(pool);
+  (globalThis as GlobalWithPool)[GLOBAL_KEY] = { pool, ready };
+  return ready.then(() => pool);
 }
 
-/** better-sqlite3 binds JS numbers as REAL; vec0 rejects that for rowids. */
-export function toVectorBlob(values: number[] | Float32Array): Buffer {
-  const f32 = values instanceof Float32Array ? values : Float32Array.from(values);
-  return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
+async function bootstrap(pool: Pool): Promise<void> {
+  const schema = env().DATABASE_SCHEMA;
+  const model = env().OPENAI_EMBEDDING_MODEL;
+  const dims = embeddingDimensions(model);
+
+  await pool.query(schemaSql());
+
+  // If the embedding model changed, every stored vector is meaningless —
+  // vectors from different models live in unrelated coordinate spaces, so
+  // cosine distance between them still sorts, still looks plausible, and is
+  // entirely garbage. Drop the rows rather than serve nonsense neighbours.
+  const meta = await pool.query<{ model: string; dimensions: number }>(
+    `SELECT model, dimensions FROM "${schema}".vector_meta WHERE id = 1`,
+  );
+  const previous = meta.rows[0];
+
+  if (previous && previous.dimensions !== dims) {
+    logger.warn("embedding model changed — rebuilding vector index", {
+      from: previous.model,
+      to: model,
+    });
+    await pool.query(`DROP TABLE IF EXISTS "${schema}".chunks CASCADE`);
+    await pool.query(
+      `UPDATE "${schema}".repositories
+       SET status = 'failed', status_detail = 'Embedding model changed — re-index required'`,
+    );
+    await pool.query(schemaSql());
+  }
+
+  await pool.query(
+    `INSERT INTO "${schema}".vector_meta (id, model, dimensions) VALUES (1, $1, $2)
+     ON CONFLICT (id) DO UPDATE SET model = EXCLUDED.model, dimensions = EXCLUDED.dimensions`,
+    [model, dims],
+  );
+
+  const version = await pool.query<{ v: string }>(
+    "SELECT extversion AS v FROM pg_extension WHERE extname = 'vector'",
+  );
+  logger.info("database ready", {
+    schema,
+    pgvector: version.rows[0]?.v ?? "unknown",
+  });
+}
+
+/** Convenience wrapper so callers do not repeat `(await getDb()).query(...)`. */
+export async function query<T extends QueryResultRow>(
+  text: string,
+  params: unknown[] = [],
+): Promise<T[]> {
+  const pool = await getDb();
+  const result = await pool.query<T>(text, params);
+  return result.rows;
+}
+
+/**
+ * Run a function inside a transaction, releasing the client either way.
+ *
+ * Ingestion writes thousands of rows; without a transaction each INSERT is its
+ * own round trip *and* its own commit, which against a hosted database an ocean
+ * away is the difference between seconds and minutes.
+ */
+export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const pool = await getDb();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * pgvector accepts its input as the text form `[0.1,0.2,...]` and casts.
+ * There is no binary protocol for it in `pg`, so this is the representation on
+ * both the write and read paths.
+ */
+export function toVectorLiteral(values: number[]): string {
+  return `[${values.join(",")}]`;
+}
+
+/** Schema-qualified table name for use in SQL templates. */
+export function tbl(name: string): string {
+  return `"${env().DATABASE_SCHEMA}".${name}`;
+}
+
+/** Closes the pool. Used by scripts and tests so the process can exit. */
+export async function closeDb(): Promise<void> {
+  const cached = (globalThis as GlobalWithPool)[GLOBAL_KEY];
+  if (!cached) return;
+  delete (globalThis as GlobalWithPool)[GLOBAL_KEY];
+  await cached.pool.end();
 }

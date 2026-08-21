@@ -1,52 +1,53 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 /**
  * End-to-end test of the storage and retrieval path with the network stubbed.
  *
  * This is the test that earns its keep. The unit tests cover chunking, fusion
- * and query building in isolation, but the parts most likely to break in
- * practice are the seams: the sqlite-vec rowid binding (JS numbers bind as
- * REAL and the extension rejects them), the FTS5 external-content triggers,
- * partition-key filtering across repos, and neighbour expansion joining back
- * to the right file. None of that is exercised by testing pure functions, and
- * all of it fails loudly here if a schema or binding detail regresses.
+ * and query building in isolation, but the parts most likely to break are the
+ * seams: pgvector's text-literal cast on both write and read, the generated
+ * `tsvector` column, `ANY($1::bigint[])` array binding, BIGINT arriving as a
+ * string from `pg`, and the neighbour self-join. None of that is exercised by
+ * testing pure functions, and all of it fails loudly here.
  *
- * Only the OpenAI calls are faked. Everything else — SQLite, the vector
- * extension, the real ingestion pipeline — runs for real.
+ * Only the OpenAI calls are faked. Postgres and pgvector run for real.
+ *
+ * ## Why this needs a database, and how it stays safe
+ * The SQLite version ran with zero setup in a temp file. That is genuinely
+ * lost, and it is the real cost of this migration. In exchange the test now
+ * exercises the same engine production uses instead of a different one.
+ *
+ * It runs only when `TEST_DATABASE_URL` is set — deliberately a *separate*
+ * variable from `DATABASE_URL`, so a stray `npm test` can never point at a real
+ * index. Every run gets its own randomly named schema, dropped afterwards, so
+ * concurrent runs and a shared Neon database cannot collide.
  */
 
-const DB_PATH = path.join(
-  fs.mkdtempSync(path.join(os.tmpdir(), "cda-test-")),
-  "index.db",
-);
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
+
+const TEST_SCHEMA = `cda_test_${Math.random().toString(36).slice(2, 10)}`;
 
 process.env.OPENAI_API_KEY = "test-key-not-used";
-process.env.DATABASE_PATH = DB_PATH;
+process.env.DATABASE_URL = TEST_DATABASE_URL ?? "postgres://unused";
+process.env.DATABASE_SCHEMA = TEST_SCHEMA;
 process.env.LOG_LEVEL = "error";
 
 /**
  * Deterministic stand-in for a real embedding model: hash tokens into a
  * 1536-dimension bag-of-words vector and L2-normalise.
  *
- * It is not semantic — it cannot match "authenticate" to "login" — but it is
- * a genuine vector space where lexical overlap produces higher cosine
- * similarity. That is enough to prove the plumbing ranks correctly, and unlike
- * a random or constant vector it would actually catch an ordering bug.
+ * Not semantic — it cannot match "authenticate" to "login" — but it is a
+ * genuine vector space where lexical overlap produces higher cosine
+ * similarity. Enough to prove the plumbing ranks correctly, and unlike a random
+ * or constant vector it would actually catch an ordering bug.
  */
 const DIMENSIONS = 1536;
 
 function fakeEmbedding(text: string): number[] {
   const vector = new Array<number>(DIMENSIONS).fill(0);
-  const tokens =
-    text
-      .toLowerCase()
-      .split(/[^a-z0-9_]+/)
-      .filter((t) => t.length > 2) ?? [];
-
-  for (const token of tokens) {
+  for (const token of text.toLowerCase().split(/[^a-z0-9_]+/)) {
+    if (token.length < 3) continue;
     let hash = 2166136261;
     for (let i = 0; i < token.length; i++) {
       hash ^= token.charCodeAt(i);
@@ -54,7 +55,6 @@ function fakeEmbedding(text: string): number[] {
     }
     vector[Math.abs(hash) % DIMENSIONS] += 1;
   }
-
   const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0)) || 1;
   return vector.map((v) => v / norm);
 }
@@ -171,192 +171,199 @@ let retrieval: Retrieval;
 let db: Db;
 let repoId: string;
 
-beforeAll(async () => {
-  // Dynamic import so the env vars above are set before the DB module
-  // initialises and reads DATABASE_PATH.
-  pipeline = await import("@/lib/ingest/pipeline");
-  retrieval = await import("@/lib/retrieval");
-  db = await import("@/lib/db");
+describeDb("postgres pipeline", () => {
+  beforeAll(async () => {
+    pipeline = await import("@/lib/ingest/pipeline");
+    retrieval = await import("@/lib/retrieval");
+    db = await import("@/lib/db");
 
-  const started = pipeline.startIngestion({
-    sourceType: "upload",
-    sourceRef: "demo-api",
-    files: FIXTURE_FILES,
-  });
-  repoId = started.id;
-  await started.done;
-}, 30_000);
-
-afterAll(() => {
-  fs.rmSync(path.dirname(DB_PATH), { recursive: true, force: true });
-});
-
-describe("ingestion", () => {
-  it("finishes and marks the repository ready", () => {
-    const repo = db
-      .getDb()
-      .prepare("SELECT status, file_count, chunk_count FROM repositories WHERE id = ?")
-      .get(repoId) as { status: string; file_count: number; chunk_count: number };
-
-    expect(repo.status).toBe("ready");
-    expect(repo.file_count).toBe(5); // the two excluded fixtures are gone
-    expect(repo.chunk_count).toBeGreaterThan(4);
-  });
-
-  it("excludes dependency and lockfile noise from the index", () => {
-    const paths = (
-      db.getDb().prepare("SELECT path FROM files WHERE repo_id = ?").all(repoId) as Array<{
-        path: string;
-      }>
-    ).map((r) => r.path);
-
-    expect(paths).toContain("src/auth/session.ts");
-    expect(paths.some((p) => p.includes("node_modules"))).toBe(false);
-    expect(paths).not.toContain("package-lock.json");
-  });
-
-  it("strips the uploaded root folder from stored paths", () => {
-    const paths = (
-      db.getDb().prepare("SELECT path FROM files WHERE repo_id = ?").all(repoId) as Array<{
-        path: string;
-      }>
-    ).map((r) => r.path);
-    expect(paths.every((p) => !p.startsWith("demo/"))).toBe(true);
-  });
-
-  it("writes one vector per chunk", () => {
-    const chunks = db
-      .getDb()
-      .prepare("SELECT COUNT(*) AS n FROM chunks WHERE repo_id = ?")
-      .get(repoId) as { n: number };
-    const vectors = db
-      .getDb()
-      .prepare("SELECT COUNT(*) AS n FROM chunk_vectors WHERE repo_id = ?")
-      .get(repoId) as { n: number };
-
-    expect(vectors.n).toBe(chunks.n);
-  });
-
-  it("keeps the FTS index in sync via triggers", () => {
-    const hits = db
-      .getDb()
-      .prepare(
-        `SELECT COUNT(*) AS n FROM chunks_fts
-         JOIN chunks c ON c.id = chunks_fts.rowid
-         WHERE chunks_fts MATCH ? AND c.repo_id = ?`,
-      )
-      .get('"validatesession"', repoId) as { n: number };
-
-    expect(hits.n).toBeGreaterThan(0);
-  });
-
-  it("builds a repo map with dependencies and routes", () => {
-    const row = db
-      .getDb()
-      .prepare("SELECT repo_map FROM repositories WHERE id = ?")
-      .get(repoId) as { repo_map: string };
-    const map = JSON.parse(row.repo_map);
-
-    expect(map.dependencies[0].runtime).toContain("express");
-    expect(map.endpoints).toContainEqual(
-      expect.objectContaining({ method: "POST", path: "/api/login" }),
-    );
-    expect(map.endpoints).toContainEqual(
-      expect.objectContaining({ method: "GET", path: "/health" }),
-    );
-    expect(map.readmeExcerpt).toContain("Demo API");
-  });
-});
-
-describe("hybrid retrieval", () => {
-  it("finds the file that defines an identifier the user names exactly", async () => {
-    const result = await retrieval.retrieve(repoId, "where is validateSession implemented");
-
-    expect(result.chunks.length).toBeGreaterThan(0);
-    expect(result.chunks.map((c) => c.filePath)).toContain("src/auth/session.ts");
-    expect(result.stats.ftsQuery).toContain('"validatesession"');
-  });
-
-  it("routes a connection-pool question to the database module", async () => {
-    const result = await retrieval.retrieve(repoId, "how is the postgres connection pool configured");
-    expect(result.chunks[0].filePath).toBe("src/db/connection.ts");
-  });
-
-  it("reports which retriever surfaced each chunk", async () => {
-    const result = await retrieval.retrieve(repoId, "validateSession jwt verify");
-    const vias = new Set(result.chunks.map((c) => c.via));
-    // At minimum something came from a real retriever, not just expansion.
-    expect([...vias].some((v) => v === "vector" || v === "keyword" || v === "both")).toBe(true);
-  });
-
-  it("still answers when the keyword side finds nothing", async () => {
-    // All stopwords — buildFtsQuery returns null and retrieval must fall back
-    // to vector-only rather than throwing.
-    const result = await retrieval.retrieve(repoId, "how does it do that");
-    expect(result.stats.ftsQuery).toBeNull();
-    expect(result.chunks.length).toBeGreaterThan(0);
-  });
-
-  it("respects the context token budget", async () => {
-    const result = await retrieval.retrieve(repoId, "session token express route pool");
-    const total = result.chunks.reduce((sum, c) => sum + c.tokenCount, 0);
-    expect(result.stats.contextTokens).toBe(total);
-    expect(total).toBeLessThanOrEqual(12_000);
-  });
-
-  it("never leaks chunks from another repository", async () => {
-    const other = pipeline.startIngestion({
+    const started = await pipeline.startIngestion({
       sourceType: "upload",
-      sourceRef: "other-repo",
-      files: [
-        {
-          path: "other/src/session.ts",
-          content:
-            "export function validateSession(token: string) {\n  return token === 'other-repo-secret';\n}\n",
-        },
-      ],
+      sourceRef: "demo-api",
+      files: FIXTURE_FILES,
     });
-    await other.done;
+    repoId = started.id;
+    await started.done;
+  }, 120_000);
 
-    const result = await retrieval.retrieve(repoId, "validateSession");
-    const ids = result.chunks.map((c) => c.chunkId);
-
-    const leaked = db
-      .getDb()
-      .prepare(
-        `SELECT COUNT(*) AS n FROM chunks WHERE repo_id != ? AND id IN (${ids
-          .map(() => "?")
-          .join(",")})`,
-      )
-      .get(repoId, ...ids) as { n: number };
-
-    expect(leaked.n).toBe(0);
-
-    pipeline.deleteRepository(other.id);
+  afterAll(async () => {
+    // The schema is disposable and uniquely named, so this cannot touch
+    // anything but the rows this file created.
+    await db.query(`DROP SCHEMA IF EXISTS "${TEST_SCHEMA}" CASCADE`).catch(() => undefined);
+    await db.closeDb();
   });
-});
 
-describe("deleteRepository", () => {
-  it("removes chunks, files and vectors together", async () => {
-    const temp = pipeline.startIngestion({
-      sourceType: "upload",
-      sourceRef: "throwaway",
-      files: [{ path: "t/src/index.ts", content: "export const answer = 42;\n" }],
-    });
-    await temp.done;
+  describe("ingestion", () => {
+    it("finishes and marks the repository ready", async () => {
+      const [repo] = await db.query<{
+        status: string;
+        file_count: number;
+        chunk_count: number;
+      }>(
+        `SELECT status, file_count, chunk_count FROM ${db.tbl("repositories")} WHERE id = $1`,
+        [repoId],
+      );
 
-    pipeline.deleteRepository(temp.id);
-
-    const counts = ["files", "chunks", "chunk_vectors"].map((table) => {
-      const row = db
-        .getDb()
-        .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE repo_id = ?`)
-        .get(temp.id) as { n: number };
-      return row.n;
+      expect(repo.status).toBe("ready");
+      expect(Number(repo.file_count)).toBe(5); // the two excluded fixtures are gone
+      expect(Number(repo.chunk_count)).toBeGreaterThan(4);
     });
 
-    // chunk_vectors is a virtual table, so FK cascade does not reach it —
-    // this asserts the explicit cleanup in deleteRepository still happens.
-    expect(counts).toEqual([0, 0, 0]);
+    it("excludes dependency and lockfile noise from the index", async () => {
+      const rows = await db.query<{ path: string }>(
+        `SELECT path FROM ${db.tbl("files")} WHERE repo_id = $1`,
+        [repoId],
+      );
+      const paths = rows.map((r) => r.path);
+
+      expect(paths).toContain("src/auth/session.ts");
+      expect(paths.some((p) => p.includes("node_modules"))).toBe(false);
+      expect(paths).not.toContain("package-lock.json");
+    });
+
+    it("strips the uploaded root folder from stored paths", async () => {
+      const rows = await db.query<{ path: string }>(
+        `SELECT path FROM ${db.tbl("files")} WHERE repo_id = $1`,
+        [repoId],
+      );
+      expect(rows.every((r) => !r.path.startsWith("demo/"))).toBe(true);
+    });
+
+    it("writes an embedding for every chunk", async () => {
+      const [counts] = await db.query<{ total: string; embedded: string }>(
+        `SELECT COUNT(*) AS total,
+                COUNT(embedding) AS embedded
+           FROM ${db.tbl("chunks")} WHERE repo_id = $1`,
+        [repoId],
+      );
+      expect(Number(counts.embedded)).toBe(Number(counts.total));
+      expect(Number(counts.total)).toBeGreaterThan(0);
+    });
+
+    it("populates the generated tsvector column automatically", async () => {
+      // No triggers to keep in sync — Postgres recomputes `search` on write,
+      // so it cannot drift from embed_text the way the SQLite FTS index could.
+      const [row] = await db.query<{ n: string }>(
+        `SELECT COUNT(*) AS n
+           FROM ${db.tbl("chunks")}, to_tsquery('simple', 'validatesession') AS q
+          WHERE repo_id = $1 AND search @@ q`,
+        [repoId],
+      );
+      expect(Number(row.n)).toBeGreaterThan(0);
+    });
+
+    it("builds a repo map with dependencies and routes", async () => {
+      const [row] = await db.query<{ repo_map: Record<string, never> }>(
+        `SELECT repo_map FROM ${db.tbl("repositories")} WHERE id = $1`,
+        [repoId],
+      );
+      // jsonb round-trips as an object, not a string.
+      const map = row.repo_map as unknown as {
+        dependencies: Array<{ runtime: string[] }>;
+        endpoints: Array<{ method: string; path: string }>;
+        readmeExcerpt: string;
+      };
+
+      expect(map.dependencies[0].runtime).toContain("express");
+      expect(map.endpoints).toContainEqual(
+        expect.objectContaining({ method: "POST", path: "/api/login" }),
+      );
+      expect(map.endpoints).toContainEqual(
+        expect.objectContaining({ method: "GET", path: "/health" }),
+      );
+      expect(map.readmeExcerpt).toContain("Demo API");
+    });
+  });
+
+  describe("hybrid retrieval", () => {
+    it("finds the file that defines an identifier the user names exactly", async () => {
+      const result = await retrieval.retrieve(repoId, "where is validateSession implemented");
+
+      expect(result.chunks.length).toBeGreaterThan(0);
+      expect(result.chunks.map((c) => c.filePath)).toContain("src/auth/session.ts");
+      expect(result.stats.ftsQuery).toContain("validatesession");
+    });
+
+    it("routes a connection-pool question to the database module", async () => {
+      const result = await retrieval.retrieve(
+        repoId,
+        "how is the postgres connection pool configured",
+      );
+      expect(result.chunks[0].filePath).toBe("src/db/connection.ts");
+    });
+
+    it("reports which retriever surfaced each chunk", async () => {
+      const result = await retrieval.retrieve(repoId, "validateSession jwt verify");
+      const vias = new Set(result.chunks.map((c) => c.via));
+      expect([...vias].some((v) => v === "vector" || v === "keyword" || v === "both")).toBe(
+        true,
+      );
+    });
+
+    it("still answers when the keyword side finds nothing", async () => {
+      // All stopwords — buildTsQuery returns null and retrieval must fall back
+      // to vector-only rather than throwing.
+      const result = await retrieval.retrieve(repoId, "how does it do that");
+      expect(result.stats.ftsQuery).toBeNull();
+      expect(result.chunks.length).toBeGreaterThan(0);
+    });
+
+    it("respects the context token budget", async () => {
+      const result = await retrieval.retrieve(repoId, "session token express route pool");
+      const total = result.chunks.reduce((sum, c) => sum + c.tokenCount, 0);
+      expect(result.stats.contextTokens).toBe(total);
+      expect(total).toBeLessThanOrEqual(12_000);
+    });
+
+    it("never leaks chunks from another repository", async () => {
+      const other = await pipeline.startIngestion({
+        sourceType: "upload",
+        sourceRef: "other-repo",
+        files: [
+          {
+            path: "other/src/session.ts",
+            content:
+              "export function validateSession(token: string) {\n  return token === 'other-repo-secret';\n}\n",
+          },
+        ],
+      });
+      await other.done;
+
+      const result = await retrieval.retrieve(repoId, "validateSession");
+      const ids = result.chunks.map((c) => c.chunkId);
+
+      const [leaked] = await db.query<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM ${db.tbl("chunks")}
+          WHERE repo_id <> $1 AND id = ANY($2::bigint[])`,
+        [repoId, ids],
+      );
+
+      expect(Number(leaked.n)).toBe(0);
+
+      await pipeline.deleteRepository(other.id);
+    });
+  });
+
+  describe("deleteRepository", () => {
+    it("cascades to files and chunks", async () => {
+      const temp = await pipeline.startIngestion({
+        sourceType: "upload",
+        sourceRef: "throwaway",
+        files: [{ path: "t/src/index.ts", content: "export const answer = 42;\n" }],
+      });
+      await temp.done;
+
+      await pipeline.deleteRepository(temp.id);
+
+      // Unlike the SQLite version there is no separate vector table to clean up
+      // by hand — embeddings are a column, so ON DELETE CASCADE reaches them.
+      for (const table of ["files", "chunks"]) {
+        const [row] = await db.query<{ n: string }>(
+          `SELECT COUNT(*) AS n FROM ${db.tbl(table)} WHERE repo_id = $1`,
+          [temp.id],
+        );
+        expect(Number(row.n), table).toBe(0);
+      }
+    });
   });
 });

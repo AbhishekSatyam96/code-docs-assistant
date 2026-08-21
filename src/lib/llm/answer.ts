@@ -3,7 +3,7 @@ import "server-only";
 import { nanoid } from "nanoid";
 
 import { LIMITS, env, estimateCostUsd } from "@/lib/config";
-import { getDb } from "@/lib/db";
+import { query, tbl } from "@/lib/db";
 import { triageQuestion } from "@/lib/guardrails/triage";
 import { logger } from "@/lib/observability/logger";
 import { recordTrace } from "@/lib/observability/traces";
@@ -44,12 +44,17 @@ export async function* ask(input: AskInput): AsyncGenerator<AnswerEvent> {
   const log = logger.bind({ traceId, repoId: input.repoId });
   const startedAt = performance.now();
 
-  const db = getDb();
-  const repo = db
-    .prepare("SELECT id, name, status, repo_map, chunk_count FROM repositories WHERE id = ?")
-    .get(input.repoId) as
-    | { id: string; name: string; status: string; repo_map: string | null; chunk_count: number }
-    | undefined;
+  const [repo] = await query<{
+    id: string;
+    name: string;
+    status: string;
+    // jsonb is deserialised by `pg`, so this arrives as an object, not text.
+    repo_map: RepoMap | null;
+    chunk_count: string;
+  }>(
+    `SELECT id, name, status, repo_map, chunk_count FROM ${tbl("repositories")} WHERE id = $1`,
+    [input.repoId],
+  );
 
   if (!repo) {
     yield { type: "error", message: "That repository is no longer indexed." };
@@ -76,7 +81,7 @@ export async function* ask(input: AskInput): AsyncGenerator<AnswerEvent> {
     yield { type: "sources", sources: [], resolvedQuestion: triage.resolvedQuestion };
     yield { type: "delta", text: message };
 
-    recordTrace({
+    void recordTrace({
       id: traceId,
       repoId: repo.id,
       question: input.question,
@@ -110,7 +115,7 @@ export async function* ask(input: AskInput): AsyncGenerator<AnswerEvent> {
   }
 
   // ---- Retrieval ---------------------------------------------------------
-  yield { type: "status", stage: `Searching ${repo.chunk_count.toLocaleString()} chunks` };
+  yield { type: "status", stage: `Searching ${Number(repo.chunk_count).toLocaleString()} chunks` };
 
   // Appending the extracted keywords biases the sparse retriever toward the
   // identifiers the triage step believes matter, without disturbing the dense
@@ -145,7 +150,7 @@ export async function* ask(input: AskInput): AsyncGenerator<AnswerEvent> {
   // ---- Generation --------------------------------------------------------
   yield { type: "status", stage: "Reading the code" };
 
-  const repoMap: RepoMap | null = repo.repo_map ? JSON.parse(repo.repo_map) : null;
+  const repoMap: RepoMap | null = repo.repo_map;
   const userMessage = buildUserMessage({
     repoMap: repoMap ? renderRepoMap(repoMap, repo.name) : `Repository: ${repo.name}`,
     sources: renderSources(retrieval.chunks),
@@ -186,7 +191,7 @@ export async function* ask(input: AskInput): AsyncGenerator<AnswerEvent> {
     }
   } catch (error) {
     log.error("generation failed", error);
-    recordTrace({
+    void recordTrace({
       id: traceId, repoId: repo.id, question: input.question,
       resolvedQuestion: triage.resolvedQuestion, intent: triage.intent,
       status: "error", refusalReason: (error as Error).message,
@@ -209,7 +214,7 @@ export async function* ask(input: AskInput): AsyncGenerator<AnswerEvent> {
     estimateCostUsd(model, promptTokens, completionTokens) +
     estimateCostUsd(env().OPENAI_EMBEDDING_MODEL, 0, 0);
 
-  recordTrace({
+  void recordTrace({
     id: traceId,
     repoId: repo.id,
     question: input.question,

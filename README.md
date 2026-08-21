@@ -33,13 +33,19 @@ used.
 
 ## Quick start
 
-Requires Node 20.9+ and an OpenAI API key.
+Requires Node 20.9+, an OpenAI API key, and a Postgres database with the
+`pgvector` extension (>= 0.8). A free [Neon](https://neon.tech) project works;
+so does the local Postgres in `docker-compose.yml`.
 
 ```bash
 npm install
-cp .env.example .env      # add your OPENAI_API_KEY
+cp .env.example .env      # add OPENAI_API_KEY and DATABASE_URL
 npm run dev
 ```
+
+The app creates its own schema (`code_docs` by default) on first connection —
+no migration step, and nothing outside that schema is touched, so it can share
+a database with another project.
 
 Open http://localhost:3000, paste a GitHub URL (or pick a local folder), wait
 for indexing, and start asking.
@@ -47,14 +53,15 @@ for indexing, and start asking.
 Everything else:
 
 ```bash
-npm test          # 59 unit + integration tests, no API key needed
+npm test          # unit tests need nothing; integration tests need TEST_DATABASE_URL
 npm run typecheck
 npm run lint
 npm run check     # all three
 npm run eval      # retrieval quality report (needs an API key, costs a few cents)
 ```
 
-With Docker:
+With Docker — brings up Postgres + pgvector alongside the app, so it needs no
+external database:
 
 ```bash
 OPENAI_API_KEY=sk-... docker compose up --build
@@ -62,14 +69,15 @@ OPENAI_API_KEY=sk-... docker compose up --build
 
 ### Configuration
 
-Only `OPENAI_API_KEY` is required. The interesting knobs:
+`OPENAI_API_KEY` and `DATABASE_URL` are required. The interesting knobs:
 
 | Variable | Default | Notes |
 |---|---|---|
 | `OPENAI_ANSWER_MODEL` | `gpt-4o` | See [model choices](#model-and-infrastructure-choices) for why not 4.1 |
 | `OPENAI_UTILITY_MODEL` | `gpt-4o-mini` | Query rewriting + intent classification |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Changing this rebuilds the vector index |
-| `DATABASE_PATH` | `./data/index.db` | SQLite file: chunks, vectors, FTS, traces |
+| `DATABASE_URL` | — | **Required.** Postgres with pgvector >= 0.8 (Neon, Supabase, RDS, local) |
+| `DATABASE_SCHEMA` | `code_docs` | Own schema, so the app can share a database without owning `public` |
 | `GITHUB_TOKEN` | — | Raises GitHub's 60/hr anonymous limit; allows private repos |
 | `OPENAI_BASE_URL` | — | Point at Azure OpenAI, LiteLLM, vLLM, etc. |
 
@@ -102,8 +110,8 @@ across six files is miserable.
 │ fetch tarball   │  │ 1. triage        gpt-4o-mini, one call:        │
 │   ↓ (in memory) │  │                  intent + rewrite + keywords   │
 │ filter files    │  │      ↓                                         │
-│   ↓             │  │ 2. retrieve      ├─ dense KNN   (sqlite-vec)   │
-│ chunk (AST-ish) │  │                  └─ BM25        (FTS5)         │
+│   ↓             │  │ 2. retrieve      ├─ dense KNN   (pgvector HNSW)│
+│ chunk (AST-ish) │  │                  └─ full-text   (tsvector)    │
 │   ↓             │  │      ↓           fuse with RRF                 │
 │ embed (batched) │  │      ↓           + neighbour expansion         │
 │   ↓             │  │ 3. assemble      repo map + numbered sources   │
@@ -114,9 +122,9 @@ across six files is miserable.
    │                 └─┬──────────────────────────────────────────────┘
    │                   │
 ┌──▼───────────────────▼──────────────────────────────────────────────┐
-│  SQLite (one file)                                                  │
-│  repositories · files · chunks · chunks_fts (FTS5)                  │
-│  chunk_vectors (sqlite-vec vec0, partitioned by repo) · traces      │
+│  Postgres + pgvector (one schema)                                   │
+│  repositories · files · traces                                      │
+│  chunks — content, embedding vector(1536), generated tsvector       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -135,7 +143,7 @@ src/
 ├── lib/
 │   ├── config.ts           every tunable, in one place
 │   ├── types.ts            wire types shared by server + browser
-│   ├── db/                 SQLite + sqlite-vec setup, schema
+│   ├── db/                 pool, schema bootstrap, query helpers
 │   ├── ingest/             sources → filter → chunk → repo map → pipeline
 │   ├── retrieval/          hybrid search, RRF, FTS query builder
 │   ├── llm/                client, prompts, answer pipeline
@@ -263,11 +271,22 @@ rare identifier and a paraphrase disagree.
 
 **Two details that mattered more than expected:**
 
-1. **FTS5 tokenizer config.** `tokenize="unicode61 ... tokenchars '_$.'"` keeps
-   `_`, `$` and `.` inside tokens, so `handleRequest`, `$scope` and
-   `res.status` survive tokenisation instead of being shredded. The query
-   builder also splits camelCase, so "auth middleware" matches `authMiddleware`
-   and a pasted `getUserById` matches prose about "get user by id".
+1. **The text search configuration is `simple`, not `english`.** `english`
+   stems and strips stopwords, which is right for prose and wrong for code: it
+   collapses `parsing`/`parser`/`parse` into one token and discards `in`, `to`
+   and `not` — all of which are real identifiers. `simple` only lowercases.
+   The cost is that stopword removal has to move to the query side, which
+   [`fts-query.ts`](src/lib/retrieval/fts-query.ts) does along with camelCase
+   splitting, so "auth middleware" matches `authMiddleware` and a pasted
+   `getUserById` matches prose about "get user by id".
+
+   The identifier heuristic behind that splitting is worth one more sentence,
+   because I got it wrong: it originally counted *any* uppercase letter as
+   evidence of an identifier, which made every sentence-initial capital one.
+   "How does the view engine render?" therefore searched for `how` — exempting
+   the most common word in English from the stopword list. It surfaced in a
+   trace as `how | view | engine | render`. Evidence is now an *interior* case
+   change, `_`/`$`/`.`, or SCREAMING_CASE.
 
 2. **Neighbour expansion.** Code is sequential in a way prose isn't — a
    retrieved function often depends on imports above it or a helper below it.
@@ -285,18 +304,42 @@ noise that pollutes the fused ranking.
 | **LLM** | gpt-4o, gpt-4.1, Claude | `gpt-4o` (configurable) | 4.1 is better at reading unfamiliar code and has a bigger window. I defaulted to 4o because it works on *every* OpenAI account — a reviewer cloning this repo should never hit "model not found". Reliability over marginal quality, and it's one env var to change. |
 | **Utility model** | same model, or a smaller one | `gpt-4o-mini` | Triage is classification + rewriting. It's ~20x cheaper and adds ~300ms; using the big model here would double per-question cost for no gain. |
 | **Embeddings** | `text-embedding-3-small`, `-large`, Voyage `voyage-code-3` | `text-embedding-3-small` | Voyage is genuinely better on code and would be my production choice, but it's a second API key for whoever runs this. `-large` is 2x the dimensions and 6.5x the cost for a modest gain at this corpus size. |
-| **Vector store** | pgvector, Qdrant, Chroma, LanceDB, in-memory | **SQLite + `sqlite-vec`** | See below. |
+| **Vector store** | pgvector, Qdrant, Chroma, LanceDB, SQLite + `sqlite-vec` | **Postgres + pgvector** | See below. |
 | **Orchestration** | LangChain, LlamaIndex, **none** | **None** | See below. |
 
-**Why SQLite + sqlite-vec.** The whole index — metadata, chunk text, the BM25
-index, the vectors, and the query traces — is one file with no daemon. That
-means: hybrid search is a local join instead of a cross-service fan-out; the
-integration test runs the *real* storage engine in a temp directory in ~300ms;
-and `docker compose up` needs one container. `vec0`'s partition keys give
-per-repo KNN isolation, so a large repo can't crowd out results from the repo
-you're actually asking about. It brute-forces within a partition — fine to
-roughly 10⁵–10⁶ vectors, which comfortably covers "a codebase". Past that you
-want an ANN index, which is the pgvector/Qdrant migration described below.
+**Why Postgres + pgvector.** One database holds metadata, chunk text, the
+vectors *and* the full-text index, so hybrid retrieval is two queries against
+one system rather than a fan-out across a vector service and a relational one —
+no dual-write, no consistency window where a chunk exists in one and not the
+other. `vector(1536)` with an HNSW index over `vector_cosine_ops` handles the
+dense half; a `STORED` generated `tsvector` column with a GIN index handles the
+lexical half. And because the app holds no local state, it scales horizontally
+and deploys to anything serverless.
+
+> **This started as SQLite + `sqlite-vec`**, and that was the right call for a
+> single-node prototype: one file, no daemon, and an integration test that ran
+> the real storage engine in a temp directory in ~300ms. It moved to Postgres
+> for a concrete reason — a file on local disk cannot back a serverless
+> deployment, where the filesystem is ephemeral and per-instance. The section
+> on [productionising](#productionising-this) describes the migration that this
+> now *is*, and [what it cost](#what-the-migration-actually-cost) is written up
+> honestly rather than presented as a free win.
+
+**Two details specific to pgvector that took real reading:**
+
+1. **The operator class is load-bearing.** `vector_cosine_ops` pairs with the
+   `<=>` operator. Query with `<->` (L2) or `<#>` (inner product) and Postgres
+   does not error — it silently ignores the index and sequential-scans every
+   row. The failure mode is a correct but slow answer, which is exactly the
+   kind of bug that survives to production.
+
+2. **Filtered search under-returns.** An HNSW index knows nothing about
+   `repo_id`, so Postgres walks the index in distance order and discards
+   non-matching rows *afterwards*. Ask for 30 candidates and the scan can
+   surface 30 rows that all belong to a different repository, leaving you with
+   three. Still correct, silently degraded, and it gets worse as more repos are
+   indexed. pgvector 0.8's `hnsw.iterative_scan = 'strict_order'` exists for
+   this: when the filter eats the candidate set, keep scanning.
 
 **Why no orchestration framework.** LangChain would have saved me maybe an hour
 on the retriever glue and cost me the ability to explain what happens between
@@ -397,17 +440,24 @@ adjacent chunk of a file it already found measures nothing.
 
 #### Results — and the assumption they falsified
 
-Run against this repo's own `src/` (40 files → 106 chunks, 18 questions):
+Run against this repo's own `src/` (40 files → 115 chunks, 18 questions), on
+Postgres:
 
 | k | hybrid recall / MRR | **vector** recall / MRR | keyword recall / MRR |
 |---|---|---|---|
-| 3 | 88.9% / 0.806 | **94.4% / 0.880** | 77.8% / 0.685 |
-| 5 | 94.4% / 0.819 | **100% / 0.898** | 88.9% / 0.710 |
-| 10 | 100% / 0.831 | **100% / 0.898** | 94.4% / 0.716 |
+| 3 | 83.3% / 0.741 | **94.4% / 0.861** | 66.7% / 0.546 |
+| 10 | 94.4% / 0.778 | **100% / 0.880** | 83.3% / 0.585 |
 
 **Dense retrieval alone beats the hybrid, at every k.** That is the opposite of
 what I assumed when I built it, and it is the single most useful thing the eval
 told me.
+
+It is also the *second* time this result has appeared. The same table on the
+original SQLite backend — a completely different sparse retriever, FTS5's BM25
+rather than Postgres's `ts_rank_cd` — put vector ahead by a near-identical
+margin (88.9%/0.806 hybrid vs 94.4%/0.880 vector at k=3). Two independent
+lexical implementations reaching the same conclusion is much harder to dismiss
+as an artifact of one of them.
 
 *Why it happens.* RRF rewards agreement between retrievers, and that is exactly
 the problem when one of them is weaker. A chunk both retrievers rank mediocrely
@@ -419,8 +469,8 @@ confident correct answer, and the sparse retriever's errors get promoted.
 clear that the first two are criticisms of my measurement, not defences of the
 design:
 
-1. **The corpus is too homogeneous to test BM25 fairly.** 106 chunks from a
-   single TypeScript project where nearly every file discusses "chunk",
+1. **The corpus is too homogeneous to test lexical search fairly.** 115 chunks
+   from a single TypeScript project where nearly every file discusses "chunk",
    "query", "retrieval", "embed". IDF has almost nothing to discriminate on.
    This is the best case for dense and close to the worst case for sparse.
 2. **The question set is semantic-heavy and its lexical questions are too
@@ -438,24 +488,32 @@ would want a bigger, lexically balanced set on a real multi-language codebase
 before either keeping or removing it. Weighted RRF (down-weighting the sparse
 list) is the obvious fix and is at the top of [what I'd do next](#what-id-do-next).
 
-*One bug this found.* The first run scored keyword at 0.352 MRR, and the misses
-showed it retrieving `eval/dataset.ts` — the file containing the golden
-questions. I was indexing the answer key, so every question matched it
-verbatim. Excluding the eval directory lifted keyword MRR to 0.685 and hybrid's
-to 0.806. Worth stating plainly: **my first set of numbers was wrong**, and the
-only reason I know that is that the harness prints its misses.
+*Two bugs this found.* The first run scored keyword at 0.352 MRR, and the
+printed misses showed it retrieving `eval/dataset.ts` — the file containing the
+golden questions. I was indexing the answer key, so every question matched it
+verbatim; excluding the eval directory fixed it. Later, a trace showed the
+lexical query as `how | view | engine | render`, which is how I found that the
+identifier heuristic was treating every sentence-initial capital as a symbol
+and exempting it from the stopword list.
+
+Worth stating plainly: **my first set of numbers was wrong**, and the only
+reason I know that is that the harness prints its misses and the traces print
+the query they actually ran. Neither bug was visible in an aggregate score.
 
 **Testing.** 59 tests, no API key required.
 
 The one I'd point at is
 [`tests/pipeline.integration.test.ts`](tests/pipeline.integration.test.ts): it
-runs the real ingestion pipeline against real SQLite with real `sqlite-vec` and
-real FTS5, stubbing only the OpenAI calls. The parts most likely to break here
-aren't the pure functions — they're the seams: the `vec0` rowid binding (JS
-numbers bind as REAL and the extension rejects them, which cost me a while to
-find), the FTS5 external-content triggers, partition-key isolation across
-repos, and neighbour expansion joining back to the right file. None of that is
-exercised by unit tests and all of it fails loudly here.
+runs the real ingestion pipeline against real Postgres with real pgvector,
+stubbing only the OpenAI calls. The parts most likely to break aren't the pure
+functions — they're the seams: pgvector's text-literal cast on both the write
+and read paths, the generated `tsvector` column, `ANY($1::bigint[])` array
+binding, `BIGINT` arriving as a string, and the neighbour self-join. None of
+that is exercised by unit tests and all of it fails loudly here.
+
+It runs only when `TEST_DATABASE_URL` is set — deliberately a *separate*
+variable from `DATABASE_URL`, so a stray `npm test` can never point at a real
+index — and each run creates and drops its own randomly named schema.
 
 Writing the chunker tests found a real bug: when a unit is hard-split, an
 `overlapLines` wider than the resulting window made the stride collapse to one
@@ -471,7 +529,7 @@ CloudWatch/Cloud Logging/Loki want. `logger.bind({ traceId, repoId })` produces
 a child logger so identifiers flow through the call stack without being
 threaded through every signature. No pino, no transports; it's twenty lines.
 
-**A trace per question**, persisted in SQLite: the question, the rewritten
+**A trace per question**, persisted in Postgres: the question, the rewritten
 question, intent, retrieved chunk ids *with their fusion scores and which
 retriever found each*, split timings (embed / retrieval / LLM / total), token
 counts, and computed cost.
@@ -547,15 +605,36 @@ Honest summary: **this is a well-engineered single-node prototype.** The RAG
 design would carry over; the infrastructure would not. Here's what changes,
 roughly in the order I'd do it.
 
-### 1. The index has to move off SQLite
+### 1. The index has moved off local disk — done
 
-SQLite-on-a-volume means one writer, no horizontal scale, and a stateful pod.
-Moving to **Postgres + pgvector** (RDS / Cloud SQL / Azure Flexible Server) is
-the smallest change that fixes it: I keep hybrid search as a single query,
-because Postgres has both `tsvector` full-text and pgvector KNN. An HNSW index
-replaces the brute-force scan. The storage layer is already behind a thin
-module, so this is a rewrite of `lib/db` and the two queries in
-`lib/retrieval`, not of the pipeline.
+This was the top item on this list, and it is now the shipped design: Postgres
+with pgvector, HNSW for the dense half, a generated `tsvector` + GIN for the
+lexical half. The app holds no local state, so it runs behind a load balancer
+or on a serverless platform without a volume.
+
+#### What the migration actually cost
+
+Worth writing down, because "just move it to Postgres" reads as free and is not:
+
+- **Every database call became `async`.** `better-sqlite3` is synchronous, and
+  the whole call graph assumed it — including a server component that rendered
+  the repository list inline. That ripple is most of the diff.
+- **Round trips replaced function calls.** Two loops that were fine in-process
+  became pathological over a network: one `INSERT` per chunk, and one query per
+  neighbour lookup. Both are now single batched statements — a multi-row
+  `VALUES` list with `RETURNING id`, and a self-join. On a 3,000-chunk repo the
+  naive version would have spent minutes purely on latency.
+- **`BIGINT` arrives as a string.** `pg` does that to avoid precision loss past
+  2^53. Every id crossing the boundary is coerced once, in the row mapper,
+  rather than scattering `Number()` through the codebase.
+- **Retrieval got slower, and that is fine.** Search went from ~16 ms (SQLite,
+  in-process) to ~900 ms against Neon in another region. It looks alarming next
+  to the old number and is irrelevant next to the ~8 s the answer model takes.
+- **Zero-setup testing is genuinely lost.** The integration test used to run the
+  real engine in a temp file with no configuration. It now needs a real
+  Postgres and is skipped unless `TEST_DATABASE_URL` is set. That is a real
+  regression in developer experience, bought in exchange for testing the same
+  engine production uses.
 
 At genuinely large scale (10⁷+ vectors, many tenants) I'd move vectors to a
 dedicated store — Qdrant, Vertex AI Vector Search, or Azure AI Search — and
@@ -602,9 +681,9 @@ The one I'd actually build:
 
 Cloudflare is a genuinely interesting alternative: Workers + D1 + Vectorize +
 R2 maps almost one-to-one onto this design and would be dramatically cheaper at
-low volume. The blocker is `better-sqlite3` — the ingestion path would need
-rewriting against D1's API, and Workers' CPU limits don't suit chunking a large
-repo without splitting it across invocations.
+low volume. The blocker is no longer storage — it is that Workers' CPU limits
+don't suit chunking and embedding a large repo inside one invocation, so
+ingestion would have to be split across invocations regardless.
 
 ### 5. Cost and reliability controls
 
@@ -651,7 +730,9 @@ user trust, and it's the biggest quality gap in what I've built.
   low-value. I'd add Playwright for the ingest→ask→cite flow before adding
   React Testing Library.
 - **No migrations.** `CREATE TABLE IF NOT EXISTS` plus a rebuild-on-model-change
-  path. Fine for one file, wrong for Postgres — that needs proper migrations.
+  path against Postgres. Fine for a single schema owner, wrong the moment
+  there is a second environment — that needs a real migration chain, which the
+  sibling project does with `prisma migrate deploy`.
 - **Coverage thresholds not enforced.** Configured but not gated; I'd rather
   have 59 meaningful tests than a number.
 - **Accessibility is partial.** Focus rings, `aria-label`s on icon buttons,
@@ -674,15 +755,16 @@ output looks like code I'd have written, not like generated code.
 **What worked:**
 
 - **Deciding the hard things myself, first.** Chunking strategy, hybrid + RRF,
-  the repo map, SQLite over pgvector, no orchestration framework — these were
+  the repo map, the storage engine, no orchestration framework — these were
   decisions made before generating code, and the AI implemented against them.
   Reversing that order is how you end up with a LangChain chain you can't debug.
 - **Verifying assumptions with throwaway probes instead of trusting recall.**
-  Before writing the storage layer I ran a ten-line script against `sqlite-vec`
-  to check partition keys and KNN actually worked. That's how I found that
-  better-sqlite3 binds JS numbers as REAL and `vec0` rejects them for rowids —
-  a bug that would have been baffling three hours later, found in thirty
-  seconds by probing first.
+  Before writing either storage layer I ran a ten-line script against it first.
+  Against `sqlite-vec` that found that better-sqlite3 binds JS numbers as REAL
+  and `vec0` rejects them for rowids. Against Neon it confirmed pgvector 0.8.1
+  — which is what makes `iterative_scan` available, and the filtered-search
+  recall fix depends on it. Both are bugs that would have been baffling three
+  hours later and were thirty seconds to find up front.
 - **Reading the version-specific docs.** Next.js 16 ships its own docs in
   `node_modules`; the framework had breaking changes newer than most training
   data. Reading them beat guessing.
@@ -746,7 +828,7 @@ Roughly in priority order:
 Acknowledged rather than handled:
 
 - **The eval set is too small and too semantic-heavy** to settle the
-  hybrid-vs-dense question: 18 questions over 106 chunks, of which the 3
+  hybrid-vs-dense question: 18 questions over 115 chunks, of which the 3
   lexical ones pass in every mode and therefore carry no signal. See
   [Results](#results--and-the-assumption-they-falsified).
 - **Test files crowd out implementation.** On `expressjs/express`, most of the
@@ -768,7 +850,7 @@ Acknowledged rather than handled:
   chunks.
 - **Single-process rate limiting** doesn't survive a restart or coordinate
   across replicas.
-- **Whole-file contents are stored** in SQLite to render citations, which
+- **Whole-file contents are stored** in Postgres to render citations, which
   roughly doubles index size. Fine at this scale; wrong at 10,000 repos.
 - **No conversation persistence** — chat history is in browser memory and lost
   on reload. Traces persist; the conversation doesn't.

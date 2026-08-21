@@ -31,7 +31,7 @@ const UploadBody = z.object({
 const Body = z.discriminatedUnion("sourceType", [GitHubBody, UploadBody]);
 
 export async function GET() {
-  return NextResponse.json({ repositories: listRepositories() });
+  return NextResponse.json({ repositories: await listRepositories() });
 }
 
 export async function POST(request: Request) {
@@ -63,11 +63,11 @@ export async function POST(request: Request) {
       // Validate the URL synchronously so a typo returns 400 immediately
       // instead of surfacing as a failed background job seconds later.
       parseGitHubUrl(parsed.data.url);
-      const { id } = startIngestion({ sourceType: "github", sourceRef: parsed.data.url });
+      const { id } = await startIngestion({ sourceType: "github", sourceRef: parsed.data.url });
       return NextResponse.json({ id }, { status: 202 });
     }
 
-    const { id } = startIngestion({
+    const { id } = await startIngestion({
       sourceType: "upload",
       sourceRef: parsed.data.name,
       files: parsed.data.files,

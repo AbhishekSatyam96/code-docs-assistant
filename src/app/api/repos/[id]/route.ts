@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getDb } from "@/lib/db";
+import { query, tbl } from "@/lib/db";
 import { deleteRepository } from "@/lib/ingest/pipeline";
 import type { RepoMap } from "@/lib/ingest/repo-map";
 
@@ -13,21 +13,19 @@ interface Context {
 export async function GET(_request: Request, context: Context) {
   const { id } = await context.params;
 
-  const row = getDb()
-    .prepare(
-      `SELECT id, name, source_type, source_ref, commit_ref, status, status_detail,
-              progress, file_count, chunk_count, embed_tokens, repo_map, created_at
-       FROM repositories WHERE id = ?`,
-    )
-    .get(id) as Record<string, unknown> | undefined;
+  const [row] = await query<Record<string, unknown>>(
+    `SELECT id, name, source_type, source_ref, commit_ref, status, status_detail,
+            progress, file_count, chunk_count, embed_tokens, repo_map, created_at
+       FROM ${tbl("repositories")} WHERE id = $1`,
+    [id],
+  );
 
   if (!row) {
     return NextResponse.json({ error: "Repository not found." }, { status: 404 });
   }
 
-  const repoMap: RepoMap | null = row.repo_map
-    ? JSON.parse(row.repo_map as string)
-    : null;
+  // jsonb is deserialised by `pg`; no JSON.parse needed as it was with SQLite.
+  const repoMap = row.repo_map as RepoMap | null;
 
   return NextResponse.json({
     id: row.id,
@@ -37,11 +35,11 @@ export async function GET(_request: Request, context: Context) {
     commitRef: row.commit_ref,
     status: row.status,
     statusDetail: row.status_detail,
-    progress: row.progress,
-    fileCount: row.file_count,
-    chunkCount: row.chunk_count,
-    embedTokens: row.embed_tokens,
-    createdAt: row.created_at,
+    progress: Number(row.progress),
+    fileCount: Number(row.file_count),
+    chunkCount: Number(row.chunk_count),
+    embedTokens: Number(row.embed_tokens),
+    createdAt: Number(row.created_at),
     // The full map includes README text and every detected route; the client
     // only needs the summary bits, so trim rather than ship tens of KB.
     summary: repoMap
@@ -62,6 +60,6 @@ export async function GET(_request: Request, context: Context) {
 
 export async function DELETE(_request: Request, context: Context) {
   const { id } = await context.params;
-  deleteRepository(id);
+  await deleteRepository(id);
   return NextResponse.json({ ok: true });
 }

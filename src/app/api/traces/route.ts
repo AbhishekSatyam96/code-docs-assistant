@@ -10,5 +10,6 @@ export async function GET(request: Request) {
     100,
   );
 
-  return NextResponse.json({ stats: traceStats(), traces: listTraces(limit) });
+  const [stats, traces] = await Promise.all([traceStats(), listTraces(limit)]);
+  return NextResponse.json({ stats, traces });
 }

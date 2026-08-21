@@ -1,21 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# Debian slim rather than Alpine on purpose: better-sqlite3 publishes prebuilt
-# binaries for glibc but not reliably for musl, so Alpine would silently fall
-# back to compiling from source on every build.
+# Debian slim rather than Alpine. Nothing here needs to compile now that the
+# index lives in Postgres — `pg` is pure JavaScript — but glibc keeps the image
+# boring and avoids musl surprises if a native dependency reappears.
 ARG NODE_VERSION=22-bookworm-slim
 
 # ---- deps -------------------------------------------------------------------
-# Installed inside Linux so the native binaries match the runtime, not the
-# developer's laptop. build-essential/python3 are only a fallback for when a
-# prebuilt better-sqlite3 binary is unavailable for this arch; they never reach
-# the final image.
 FROM node:${NODE_VERSION} AS deps
 WORKDIR /app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential python3 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -28,8 +20,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 ENV NEXT_TELEMETRY_DISABLED=1
-# next.config.ts sets output:"standalone", which emits a minimal server bundle
-# plus only the node_modules that static tracing could prove are needed.
+# The build does not connect to the database — env is validated lazily, and
+# every route that touches Postgres is `force-dynamic`.
 RUN npm run build
 
 # ---- runner -----------------------------------------------------------------
@@ -39,33 +31,34 @@ WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
-    HOSTNAME=0.0.0.0 \
-    DATABASE_PATH=/data/index.db
+    HOSTNAME=0.0.0.0
 
 RUN groupadd --system --gid 1001 nodejs \
     && useradd --system --uid 1001 --gid nodejs nextjs
 
+# `standalone` emits a self-contained server plus only the node_modules that
+# static tracing could prove are needed.
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
-# Native modules must be copied by hand.
-#
-# `better-sqlite3` is a compiled .node addon, and `sqlite-vec` locates its
-# loadable extension with `require.resolve("sqlite-vec-linux-" + arch + "/vec0.so")`
-# — a runtime-computed specifier that Next's static file tracing cannot follow,
-# so the platform package is absent from the standalone output. Copying these
-# explicitly is what keeps the image from failing on its first query.
-COPY --from=deps --chown=nextjs:nodejs /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
-COPY --from=deps --chown=nextjs:nodejs /app/node_modules/bindings ./node_modules/bindings
-COPY --from=deps --chown=nextjs:nodejs /app/node_modules/file-uri-to-path ./node_modules/file-uri-to-path
-COPY --from=deps --chown=nextjs:nodejs /app/node_modules/sqlite-vec ./node_modules/sqlite-vec
-COPY --from=deps --chown=nextjs:nodejs /app/node_modules/sqlite-vec-linux-* ./node_modules/
+# `pg` is listed in serverExternalPackages, so it is required at runtime rather
+# than bundled — which means it has to actually be present in the image.
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pg ./node_modules/pg
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pg-pool ./node_modules/pg-pool
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pg-protocol ./node_modules/pg-protocol
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pg-types ./node_modules/pg-types
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pg-connection-string ./node_modules/pg-connection-string
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pg-cloudflare ./node_modules/pg-cloudflare
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/pgpass ./node_modules/pgpass
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/postgres-array ./node_modules/postgres-array
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/postgres-bytea ./node_modules/postgres-bytea
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/postgres-date ./node_modules/postgres-date
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/postgres-interval ./node_modules/postgres-interval
+COPY --from=deps --chown=nextjs:nodejs /app/node_modules/split2 ./node_modules/split2
 
-# The SQLite index lives on a volume so it survives container replacement.
-RUN mkdir -p /data && chown -R nextjs:nodejs /data
-VOLUME ["/data"]
-
+# No VOLUME: the container is stateless now. All state is in Postgres, which is
+# what makes it safe to run more than one replica.
 USER nextjs
 EXPOSE 3000
 

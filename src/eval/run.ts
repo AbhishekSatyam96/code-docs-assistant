@@ -24,13 +24,15 @@ async function main() {
   // every question match the answer key verbatim, so they are held out.
   const exclude = (flag("exclude") ?? "eval").split(",").filter(Boolean);
 
-  if (!process.env.OPENAI_API_KEY) {
-    console.error("OPENAI_API_KEY is not set. Copy .env.example to .env first.");
+  for (const required of ["OPENAI_API_KEY", "DATABASE_URL"]) {
+    if (process.env[required]) continue;
+    console.error(`${required} is not set. Copy .env.example to .env first.`);
     process.exit(1);
   }
 
-  // Keep the eval's index out of the app's database.
-  process.env.DATABASE_PATH ??= "./data/eval.db";
+  // The eval indexes a throwaway corpus, so it gets its own schema rather than
+  // writing into — and then deleting from — the schema the app is serving.
+  process.env.DATABASE_SCHEMA = process.env.EVAL_DATABASE_SCHEMA ?? "code_docs_eval";
   process.env.LOG_LEVEL ??= "warn";
 
   console.log(`\nRetrieval evaluation — ${directory} (k=${k})\n`);
@@ -103,7 +105,20 @@ function printMisses(modes: ModeReport[]) {
 const pad = (value: string, width: number) => value.padEnd(width);
 const percent = (value: number) => `${(value * 100).toFixed(1)}%`;
 
-main().catch((error) => {
-  console.error("\nEvaluation failed:", error instanceof Error ? error.message : error);
-  process.exit(1);
-});
+main()
+  .then(() => closePool())
+  .catch(async (error) => {
+    console.error("\nEvaluation failed:", error instanceof Error ? error.message : error);
+    await closePool();
+    process.exit(1);
+  });
+
+/**
+ * A connection pool holds the event loop open, so without this the CLI prints
+ * its report and then hangs until the idle timeout — which looks exactly like
+ * the eval itself being stuck.
+ */
+async function closePool(): Promise<void> {
+  const { closeDb } = await import("@/lib/db");
+  await closeDb().catch(() => undefined);
+}

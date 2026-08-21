@@ -18,7 +18,13 @@ const EnvSchema = z.object({
   OPENAI_EMBEDDING_MODEL: z.string().default("text-embedding-3-small"),
   OPENAI_BASE_URL: z.string().url().optional(),
 
-  DATABASE_PATH: z.string().default("./data/index.db"),
+  // Postgres with the pgvector extension. Neon's *pooled* endpoint in
+  // production (host contains `-pooler`); the direct endpoint is fine locally.
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  // Own schema rather than `public`, so this app can share a database with
+  // something else without either of them owning the namespace.
+  DATABASE_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/).default("code_docs"),
+
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 
   GITHUB_TOKEN: z.string().optional(),

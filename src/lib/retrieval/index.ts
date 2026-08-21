@@ -1,10 +1,10 @@
 import "server-only";
 
 import { RAG } from "@/lib/config";
-import { getDb, toVectorBlob } from "@/lib/db";
+import { query, tbl, toVectorLiteral, transaction } from "@/lib/db";
 import { embedQuery } from "@/lib/embeddings";
 import { logger } from "@/lib/observability/logger";
-import { buildFtsQuery } from "./fts-query";
+import { buildTsQuery } from "./fts-query";
 import { reciprocalRankFusion } from "./fusion";
 
 export interface RetrievedChunk {
@@ -51,37 +51,24 @@ export interface RetrieveOptions {
   expand?: boolean;
 }
 
-interface ChunkRow {
-  id: number;
-  path: string;
-  language: string;
-  symbol: string | null;
-  start_line: number;
-  end_line: number;
-  content: string;
-  token_count: number;
-  file_id: number;
-  ordinal: number;
-}
-
 /**
- * Hybrid retrieval: dense vectors + BM25 keyword, fused with RRF.
+ * Hybrid retrieval: dense vectors + Postgres full-text, fused with RRF.
  *
  * ## Why both, for code specifically
  * Embeddings capture intent ("how do we authenticate users") but are weak on
  * rare literal tokens — an exact identifier like `parseJwtPayload`, an error
  * string, or an env var name gets averaged into a generic "auth-ish" vector.
- * BM25 nails those and is useless for paraphrase. Developer questions are a
- * near-even mix of the two, so running only one retriever loses half the
- * queries. Fusing them was worth several points of recall in my eval set;
- * the numbers are in the README.
+ * Lexical search nails those and is useless for paraphrase. Developer
+ * questions are a mix of both.
+ *
+ * See the README for the eval numbers, which currently do *not* support fusion
+ * beating dense alone on a small corpus.
  */
 export async function retrieve(
   repoId: string,
-  query: string,
+  queryText: string,
   options: RetrieveOptions = {},
 ): Promise<RetrievalResult> {
-  const db = getDb();
   const k = options.k ?? RAG.finalK;
   const mode = options.mode ?? "hybrid";
   const expand = options.expand ?? RAG.neighbourExpansion;
@@ -94,69 +81,57 @@ export async function retrieve(
   const embedStart = performance.now();
   // Skipped entirely in keyword-only mode — no point paying for an embedding
   // that is never used.
-  const queryVector = useVector ? await embedQuery(query) : null;
+  const queryVector = useVector ? await embedQuery(queryText) : null;
   const embedMs = performance.now() - embedStart;
 
   const searchStart = performance.now();
+  const tsQuery = useKeyword ? buildTsQuery(queryText) : null;
 
-  const vectorHits = queryVector
-    ? (db
-        .prepare(
-          `SELECT chunk_id AS id, distance
-           FROM chunk_vectors
-           WHERE repo_id = ? AND embedding MATCH ? AND k = ?
-           ORDER BY distance`,
-        )
-        .all(repoId, toVectorBlob(queryVector), RAG.vectorCandidates) as Array<{
-        id: number;
-        distance: number;
-      }>)
-    : [];
+  // The two retrievers are independent, so they go out concurrently — the
+  // round trip to a hosted database dominates their cost and running them in
+  // sequence would pay it twice for no reason.
+  const [vectorHits, keywordHits] = await Promise.all([
+    queryVector ? denseSearch(queryVector, repoId) : Promise.resolve([]),
 
-  // ---- Sparse -----------------------------------------------------------
-  const ftsQuery = useKeyword ? buildFtsQuery(query) : null;
-  let keywordHits: Array<{ id: number; score: number }> = [];
-
-  if (ftsQuery) {
-    try {
-      keywordHits = db
-        .prepare(
-          `SELECT c.id AS id, bm25(chunks_fts) AS score
-           FROM chunks_fts
-           JOIN chunks c ON c.id = chunks_fts.rowid
-           WHERE chunks_fts MATCH ? AND c.repo_id = ?
-           ORDER BY rank
-           LIMIT ?`,
-        )
-        .all(ftsQuery, repoId, RAG.keywordCandidates) as Array<{
-        id: number;
-        score: number;
-      }>;
-    } catch (error) {
-      // A malformed MATCH expression must degrade to vector-only rather than
-      // failing the user's question outright.
-      logger.warn("fts query rejected, falling back to vector-only", {
-        ftsQuery,
-        error: (error as Error).message,
-      });
-    }
-  }
+    // `ts_rank_cd` rather than `ts_rank`: the cover-density variant accounts
+    // for how close the matched terms sit to one another, a better relevance
+    // proxy when a question contributes several related identifiers.
+    //
+    // Failure here degrades to vector-only rather than failing the question —
+    // which is also why this is not inside a transaction with the query above.
+    tsQuery
+      ? query<{ id: string; rank: number }>(
+          `SELECT id, ts_rank_cd(search, q) AS rank
+             FROM ${tbl("chunks")}, to_tsquery('simple', $1) AS q
+            WHERE repo_id = $2 AND search @@ q
+            ORDER BY rank DESC
+            LIMIT $3`,
+          [tsQuery, repoId, RAG.keywordCandidates],
+        ).catch((error: Error) => {
+          logger.warn("text search failed, falling back to vector-only", {
+            tsQuery,
+            error: error.message,
+          });
+          return [];
+        })
+      : Promise.resolve([]),
+  ]);
 
   // ---- Fuse -------------------------------------------------------------
   const fused = reciprocalRankFusion(
-    [vectorHits.map((h) => h.id), keywordHits.map((h) => h.id)],
+    [vectorHits.map((h) => Number(h.id)), keywordHits.map((h) => Number(h.id))],
     RAG.rrfK,
   );
 
-  const vectorRanks = new Map(vectorHits.map((h, i) => [h.id, i + 1]));
-  const keywordRanks = new Map(keywordHits.map((h, i) => [h.id, i + 1]));
+  const vectorRanks = new Map(vectorHits.map((h, i) => [Number(h.id), i + 1]));
+  const keywordRanks = new Map(keywordHits.map((h, i) => [Number(h.id), i + 1]));
 
   const selectedIds = fused.slice(0, k).map((f) => f.id);
   const withNeighbours = expand
-    ? expandWithNeighbours(selectedIds, repoId, k)
+    ? await expandWithNeighbours(selectedIds, repoId, k)
     : selectedIds;
 
-  const rows = loadChunks(withNeighbours);
+  const rows = await loadChunks(withNeighbours);
   const byId = new Map(rows.map((r) => [r.id, r]));
 
   const chunks: RetrievedChunk[] = [];
@@ -210,78 +185,180 @@ export async function retrieve(
     stats: {
       vectorCandidates: vectorHits.length,
       keywordCandidates: keywordHits.length,
-      ftsQuery,
+      ftsQuery: tsQuery,
       contextTokens,
     },
   };
 }
 
 /**
- * Pull the chunks immediately before and after the strongest hits.
- *
- * Code is sequential in a way prose is not: a retrieved function body very
- * often depends on the imports above it or the helper below it, and the model
- * cannot explain what it cannot see. Expanding only the top few hits keeps the
- * cost bounded while fixing the common "explains the call but not the callee"
- * failure.
+ * How hard HNSW searches before giving up. pgvector's default is 40; the index
+ * is approximate and this is the recall/latency dial. 100 is a deliberate
+ * over-spend — at this corpus size the extra work is unmeasurable and it buys
+ * noticeably better recall on the repo-filtered search below.
  */
-function expandWithNeighbours(ids: number[], repoId: string, k: number): number[] {
-  if (ids.length === 0) return ids;
-  const db = getDb();
+const EF_SEARCH = 100;
 
-  const seeds = db
-    .prepare(
-      `SELECT id, file_id, ordinal FROM chunks WHERE id IN (${ids.map(() => "?").join(",")})`,
-    )
-    .all(...ids) as Array<{ id: number; file_id: number; ordinal: number }>;
-
-  const seedById = new Map(seeds.map((s) => [s.id, s]));
-  const result: number[] = [];
-  const seen = new Set<number>();
-  const budget = Math.ceil(k * 1.5);
-
-  const neighbourStmt = db.prepare(
-    `SELECT id FROM chunks WHERE repo_id = ? AND file_id = ? AND ordinal = ?`,
-  );
-
-  for (const id of ids) {
-    if (!seen.has(id)) {
-      result.push(id);
-      seen.add(id);
+/**
+ * Dense KNN, wrapped in a transaction purely so the tuning can use `SET LOCAL`.
+ *
+ * `SET LOCAL` reverts on commit. A bare `SET` would mutate the pooled session
+ * and silently become configuration for whichever request is handed that
+ * connection next — one query's tuning leaking into everyone else's.
+ */
+async function denseSearch(
+  queryVector: number[],
+  repoId: string,
+): Promise<Array<{ id: string; distance: number }>> {
+  return transaction(async (client) => {
+    // Both settings in one statement, because every extra round trip to a
+    // hosted database is real latency — this search runs against Neon in
+    // another region, where a round trip is ~100ms and the transaction is
+    // already paying for BEGIN and COMMIT.
+    //
+    // THE FILTERED-SEARCH RECALL PROBLEM.
+    //
+    // An HNSW index knows only about vectors — it has no idea which rows
+    // belong to which repository. Postgres walks the index in distance order
+    // and only then discards rows failing `repo_id = $2`. Ask for 30 and the
+    // scan may surface 30 candidates that all belong to a different repo,
+    // leaving three results. The answer stays correct but silently
+    // under-returns, and it degrades as more repositories are indexed.
+    //
+    // pgvector 0.8's iterative scan exists for exactly this: when the filter
+    // eats the candidate set, keep scanning rather than returning short.
+    // `strict_order` preserves true distance order — `relaxed_order` is faster
+    // but can return results slightly out of order, which would make the top
+    // match not actually the top match.
+    //
+    // `iterative_scan` is tolerated rather than required: on pgvector < 0.8 it
+    // does not exist. Because a failed statement aborts the whole transaction,
+    // the fallback re-issues just the setting that always works rather than
+    // trying to continue from an aborted state.
+    try {
+      await client.query(
+        `SET LOCAL hnsw.ef_search = ${EF_SEARCH};
+         SET LOCAL hnsw.iterative_scan = 'strict_order';`,
+      );
+    } catch {
+      logger.warn("hnsw.iterative_scan unavailable — pgvector < 0.8?");
+      await client.query("ROLLBACK");
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL hnsw.ef_search = ${EF_SEARCH}`);
     }
 
-    // Only the top third of hits earn neighbours; beyond that the marginal
-    // relevance does not justify the context spend.
-    if (result.length >= budget) break;
-    if (ids.indexOf(id) >= Math.ceil(ids.length / 3)) continue;
+    const result = await client.query<{ id: string; distance: number }>(
+      `SELECT id, (embedding <=> $1::vector) AS distance
+         FROM ${tbl("chunks")}
+        WHERE repo_id = $2
+          -- A chunk written but not yet embedded (a crashed ingest, work in
+          -- flight) has a NULL embedding, and NULL <=> vector is NULL, which
+          -- sorts last under NULLS LAST — surfacing junk exactly when real
+          -- matches run out, which is when it does the most damage.
+          AND embedding IS NOT NULL
+        ORDER BY embedding <=> $1::vector
+        LIMIT $3`,
+      [toVectorLiteral(queryVector), repoId, RAG.vectorCandidates],
+    );
+    return result.rows;
+  });
+}
 
-    const seed = seedById.get(id);
-    if (!seed) continue;
+interface ChunkRow {
+  id: number;
+  path: string;
+  language: string;
+  symbol: string | null;
+  start_line: number;
+  end_line: number;
+  content: string;
+  token_count: number;
+  file_id: number;
+  ordinal: number;
+}
 
-    for (const delta of [-1, 1]) {
-      const neighbour = neighbourStmt.get(repoId, seed.file_id, seed.ordinal + delta) as
-        | { id: number }
-        | undefined;
-      if (neighbour && !seen.has(neighbour.id) && result.length < budget) {
-        result.push(neighbour.id);
-        seen.add(neighbour.id);
-      }
+/**
+ * Pull the chunks immediately before and after the strongest hits.
+ *
+ * Code is sequential in a way prose is not: a retrieved function body often
+ * depends on the imports above it or the helper below it, and the model cannot
+ * explain what it cannot see. Expanding only the top few hits keeps the cost
+ * bounded while fixing the common "explains the call but not the callee"
+ * failure.
+ *
+ * One round trip, not one per neighbour: the SQLite version could afford a
+ * query per lookup because it was an in-process function call. Against a
+ * hosted database that would be ~24 sequential round trips on every question.
+ */
+async function expandWithNeighbours(
+  ids: number[],
+  repoId: string,
+  k: number,
+): Promise<number[]> {
+  if (ids.length === 0) return ids;
+
+  // Only the top third of hits earn neighbours; beyond that the marginal
+  // relevance does not justify the context spend.
+  const seedCount = Math.ceil(ids.length / 3);
+  const seedIds = ids.slice(0, seedCount);
+
+  const neighbours = await query<{ id: string; seed_id: string }>(
+    `SELECT n.id, s.id AS seed_id
+       FROM ${tbl("chunks")} s
+       JOIN ${tbl("chunks")} n
+         ON n.file_id = s.file_id
+        AND n.ordinal IN (s.ordinal - 1, s.ordinal + 1)
+      WHERE s.id = ANY($1::bigint[]) AND n.repo_id = $2`,
+    [seedIds, repoId],
+  );
+
+  const budget = Math.ceil(k * 1.5);
+  const result: number[] = [];
+  const seen = new Set<number>();
+
+  const add = (id: number) => {
+    if (seen.has(id) || result.length >= budget) return;
+    seen.add(id);
+    result.push(id);
+  };
+
+  // Interleave: each seed, then its neighbours, preserving fused rank order.
+  for (const id of ids) {
+    add(id);
+    for (const n of neighbours.filter((row) => Number(row.seed_id) === id)) {
+      add(Number(n.id));
     }
   }
 
   return result;
 }
 
-function loadChunks(ids: number[]): ChunkRow[] {
+async function loadChunks(ids: number[]): Promise<ChunkRow[]> {
   if (ids.length === 0) return [];
-  const db = getDb();
-  return db
-    .prepare(
-      `SELECT c.id, f.path, f.language, c.symbol, c.start_line, c.end_line,
-              c.content, c.token_count, c.file_id, c.ordinal
-       FROM chunks c
-       JOIN files f ON f.id = c.file_id
-       WHERE c.id IN (${ids.map(() => "?").join(",")})`,
-    )
-    .all(...ids) as ChunkRow[];
+
+  const rows = await query<Record<string, unknown>>(
+    `SELECT c.id, f.path, f.language, c.symbol, c.start_line, c.end_line,
+            c.content, c.token_count, c.file_id, c.ordinal
+       FROM ${tbl("chunks")} c
+       JOIN ${tbl("files")} f ON f.id = c.file_id
+      WHERE c.id = ANY($1::bigint[])`,
+    [ids],
+  );
+
+  // BIGINT comes back from `pg` as a string to avoid precision loss beyond
+  // 2^53. Every id in this app is well inside safe-integer range, and the rest
+  // of the code (maps, Sets, the wire format) assumes numbers — so normalise
+  // once, here, rather than sprinkling Number() across every call site.
+  return rows.map((row) => ({
+    id: Number(row.id),
+    path: row.path as string,
+    language: row.language as string,
+    symbol: row.symbol as string | null,
+    start_line: Number(row.start_line),
+    end_line: Number(row.end_line),
+    content: row.content as string,
+    token_count: Number(row.token_count),
+    file_id: Number(row.file_id),
+    ordinal: Number(row.ordinal),
+  }));
 }

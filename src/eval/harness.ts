@@ -115,22 +115,24 @@ export async function runEvaluation(options: {
   }
 
   report(`Indexing ${files.length} files from ${rootName}…`);
-  const started = startIngestion({
+  const started = await startIngestion({
     sourceType: "upload",
     sourceRef: `eval:${rootName}`,
     files,
   });
   await started.done;
 
-  const { getDb } = await import("@/lib/db");
-  const repo = getDb()
-    .prepare("SELECT status, status_detail, file_count, chunk_count FROM repositories WHERE id = ?")
-    .get(started.id) as {
+  const { query, tbl } = await import("@/lib/db");
+  const [repo] = await query<{
     status: string;
     status_detail: string;
     file_count: number;
     chunk_count: number;
-  };
+  }>(
+    `SELECT status, status_detail, file_count, chunk_count
+       FROM ${tbl("repositories")} WHERE id = $1`,
+    [started.id],
+  );
 
   if (repo.status !== "ready") {
     throw new Error(`Indexing failed: ${repo.status_detail}`);
@@ -189,7 +191,7 @@ export async function runEvaluation(options: {
 
   // The eval index is disposable — leaving it behind would pollute the app's
   // repository list on the next `npm run dev`.
-  deleteRepository(started.id);
+  await deleteRepository(started.id);
 
   return {
     repoId: started.id,

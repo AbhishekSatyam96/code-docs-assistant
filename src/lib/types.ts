@@ -2,7 +2,7 @@
  * Wire types shared by the server pipeline and the browser.
  *
  * Kept in a neutral module — no `server-only`, no Node imports — so the client
- * bundle can import them without dragging in better-sqlite3. The server
+ * bundle can import them without dragging in the Postgres driver. The server
  * modules import from here too, which means a change to the protocol is a
  * single edit that both sides typecheck against.
  */

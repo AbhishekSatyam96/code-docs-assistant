@@ -13,13 +13,39 @@ services:
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      DATABASE_PATH: /data/index.db
-    volumes:
-      # The index is the only stateful thing in the system. Keeping it on a
-      # named volume means `docker compose up --build` does not throw away
-      # everything you have already indexed.
-      - index-data:/data
+      # Defaults to the sidecar below. Point at Neon (or any managed Postgres)
+      # to run the app stateless — which is the whole reason the index moved
+      # off local disk.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@db:5432/codedocs}
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-code_docs}
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
+  # Local Postgres for offline development. `pgvector/pgvector` is the official
+  # image with the extension already compiled in; the stock `postgres` image
+  # does not have it and `CREATE EXTENSION vector` would fail.
+  #
+  # In production this service goes away entirely and DATABASE_URL points at a
+  # managed database.
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: codedocs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The app creates its own schema on first connection, but only once the
+      # server is actually accepting connections — hence the gate above.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d codedocs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
-  index-data:
+  pgdata:

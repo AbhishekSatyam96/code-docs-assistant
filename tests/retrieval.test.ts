@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildFtsQuery } from "@/lib/retrieval/fts-query";
+import { buildTsQuery, extractSearchTerms } from "@/lib/retrieval/fts-query";
 import { reciprocalRankFusion } from "@/lib/retrieval/fusion";
 
 describe("reciprocalRankFusion", () => {
@@ -44,53 +44,109 @@ describe("reciprocalRankFusion", () => {
   });
 });
 
-describe("buildFtsQuery", () => {
+describe("extractSearchTerms", () => {
   it("drops question stopwords that would match everything", () => {
-    const query = buildFtsQuery("how does the app handle errors")!;
-    expect(query).not.toContain('"how"');
-    expect(query).not.toContain('"the"');
-    expect(query).toContain('"errors"');
-    expect(query).toContain('"handle"');
+    const terms = extractSearchTerms("how does the app handle errors");
+    expect(terms).not.toContain("how");
+    expect(terms).not.toContain("the");
+    expect(terms).toEqual(expect.arrayContaining(["errors", "handle"]));
   });
 
   it("keeps the identifier and adds its component words", () => {
-    const query = buildFtsQuery("where is parseJwtPayload called")!;
-    expect(query).toContain('"parsejwtpayload"');
-    expect(query).toContain('"parse"');
-    expect(query).toContain('"jwt"');
-    expect(query).toContain('"payload"');
+    const terms = extractSearchTerms("where is parseJwtPayload called");
+    expect(terms).toEqual(
+      expect.arrayContaining(["parsejwtpayload", "parse", "jwt", "payload"]),
+    );
   });
 
-  it("splits snake_case and dotted paths", () => {
-    const query = buildFtsQuery("what does get_user_by_id do")!;
-    expect(query).toContain('"get_user_by_id"');
-    expect(query).toContain('"user"');
-  });
-
-  it("quotes every term so FTS5 operators cannot be injected", () => {
-    // `OR`, `NEAR` and `*` are FTS5 syntax; none may survive unquoted.
-    const query = buildFtsQuery('session OR NEAR("secret") AND *')!;
-    for (const term of query.split(" OR ")) {
-      expect(term).toMatch(/^"[^"]*"$/);
+  /**
+   * Regression, found in a production trace. The identifier test used to be
+   * "contains an uppercase letter", so a sentence-initial capital counted —
+   * and "How does the view engine render?" searched for `how`, exempting the
+   * most common word in English from the stopword list.
+   */
+  it("does not treat a sentence-initial capital as an identifier", () => {
+    for (const question of [
+      "How does the view engine render templates?",
+      "What is the router doing?",
+      "Where are errors handled?",
+      "The app handles requests",
+    ]) {
+      const terms = extractSearchTerms(question);
+      for (const stopword of ["how", "what", "where", "the"]) {
+        expect(terms, question).not.toContain(stopword);
+      }
     }
   });
 
-  it("escapes embedded double quotes rather than breaking the expression", () => {
-    const query = buildFtsQuery('find the "config" loader');
-    expect(query).not.toBeNull();
-    // Balanced quotes overall — no dangling quote that would be a syntax error.
-    expect((query!.match(/"/g) ?? []).length % 2).toBe(0);
+  it("still recognises the identifier shapes that matter", () => {
+    // Interior case change, snake_case, dotted, and SCREAMING_CASE.
+    expect(extractSearchTerms("ConfigStore")).toContain("config");
+    expect(extractSearchTerms("get_user_by_id")).toContain("user");
+    expect(extractSearchTerms("res.status")).toContain("status");
+    expect(extractSearchTerms("HTTP handling")).toContain("http");
+  });
+
+  it("keeps a PascalCase word even though it is not flagged as an identifier", () => {
+    // `View` has no interior case change, so the heuristic says "not an
+    // identifier" — which costs nothing, because it is not a stopword either.
+    expect(extractSearchTerms("how does View work")).toContain("view");
+  });
+
+  it("splits snake_case and dotted paths", () => {
+    expect(extractSearchTerms("what does get_user_by_id do")).toEqual(
+      expect.arrayContaining(["get_user_by_id", "user"]),
+    );
+    expect(extractSearchTerms("check res.status handling")).toEqual(
+      expect.arrayContaining(["res.status", "res", "status"]),
+    );
+  });
+
+  it("caps term count so the tsquery stays bounded", () => {
+    const long = Array.from({ length: 100 }, (_, i) => `identifier${i}`).join(" ");
+    expect(extractSearchTerms(long).length).toBeLessThanOrEqual(24);
+  });
+});
+
+describe("buildTsQuery", () => {
+  it("OR-joins the surviving terms", () => {
+    const query = buildTsQuery("where is validateSession implemented")!;
+    expect(query.split(" | ")).toEqual(expect.arrayContaining(["validatesession"]));
+    expect(query).toContain(" | ");
+  });
+
+  /**
+   * `to_tsquery` parses a query language — `&`, `|`, `!`, `<->`, parens and
+   * `:*` are all operators. Rather than escaping, every term is reduced to
+   * [a-z0-9_], which makes an operator unrepresentable by construction. These
+   * cases assert that property directly rather than checking for specific
+   * escapes, so the test still holds if the sanitiser is reimplemented.
+   */
+  it("cannot emit a tsquery operator, whatever the input", () => {
+    for (const attack of [
+      'session | NEAR("secret")',
+      "auth & !private",
+      "token:* <-> secret",
+      "(a | b) & c",
+      "'; DROP TABLE chunks; --",
+      "term'''quote",
+    ]) {
+      const query = buildTsQuery(attack);
+      if (query === null) continue;
+      for (const term of query.split(" | ")) {
+        expect(term).toMatch(/^[a-z0-9_]+$/);
+      }
+    }
   });
 
   it("returns null when nothing usable survives, so callers can fall back", () => {
-    expect(buildFtsQuery("how does it work")).toBeNull();
-    expect(buildFtsQuery("???")).toBeNull();
-    expect(buildFtsQuery("")).toBeNull();
+    expect(buildTsQuery("how does it work")).toBeNull();
+    expect(buildTsQuery("???")).toBeNull();
+    expect(buildTsQuery("")).toBeNull();
   });
 
-  it("caps term count to keep the MATCH expression bounded", () => {
-    const long = Array.from({ length: 100 }, (_, i) => `identifier${i}`).join(" ");
-    const query = buildFtsQuery(long)!;
-    expect(query.split(" OR ").length).toBeLessThanOrEqual(24);
+  it("de-duplicates terms", () => {
+    const query = buildTsQuery("session session SESSION")!;
+    expect(query.split(" | ")).toEqual(["session"]);
   });
 });

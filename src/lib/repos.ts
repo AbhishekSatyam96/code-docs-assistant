@@ -1,23 +1,21 @@
 import "server-only";
 
-import { getDb } from "@/lib/db";
+import { query, tbl } from "@/lib/db";
 import type { RepoSummary } from "@/lib/types";
 
 /**
  * Shared by the server-rendered page and `GET /api/repos`.
  *
- * The page renders the first list directly from SQLite so there is no
+ * The page renders the first list directly from Postgres so there is no
  * fetch-on-mount flash; the same function backs the polling endpoint the
- * client uses afterwards, so both paths can never drift apart.
+ * client uses afterwards, so the two paths can never drift apart.
  */
-export function listRepositories(): RepoSummary[] {
-  const rows = getDb()
-    .prepare(
-      `SELECT id, name, source_type, source_ref, commit_ref, status, status_detail,
-              progress, file_count, chunk_count, created_at
-       FROM repositories ORDER BY created_at DESC`,
-    )
-    .all() as Array<Record<string, unknown>>;
+export async function listRepositories(): Promise<RepoSummary[]> {
+  const rows = await query<Record<string, unknown>>(
+    `SELECT id, name, source_type, source_ref, commit_ref, status, status_detail,
+            progress, file_count, chunk_count, created_at
+       FROM ${tbl("repositories")} ORDER BY created_at DESC`,
+  );
 
   return rows.map((row) => ({
     id: row.id as string,
@@ -27,9 +25,11 @@ export function listRepositories(): RepoSummary[] {
     commitRef: row.commit_ref as string | null,
     status: row.status as RepoSummary["status"],
     statusDetail: row.status_detail as string | null,
-    progress: row.progress as number,
-    fileCount: row.file_count as number,
-    chunkCount: row.chunk_count as number,
-    createdAt: row.created_at as number,
+    progress: Number(row.progress),
+    fileCount: Number(row.file_count),
+    chunkCount: Number(row.chunk_count),
+    // BIGINT arrives as a string from `pg` to avoid precision loss past 2^53.
+    // These are epoch milliseconds, comfortably inside safe-integer range.
+    createdAt: Number(row.created_at),
   }));
 }

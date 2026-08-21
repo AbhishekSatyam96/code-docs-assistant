@@ -13,11 +13,16 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
  * than surfacing later.
  */
 
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
+const TEST_SCHEMA = `cda_eval_${Math.random().toString(36).slice(2, 10)}`;
+
 const WORKDIR = fs.mkdtempSync(path.join(os.tmpdir(), "cda-eval-"));
 const REPO_DIR = path.join(WORKDIR, "sample-project");
 
 process.env.OPENAI_API_KEY = "test-key-not-used";
-process.env.DATABASE_PATH = path.join(WORKDIR, "eval.db");
+process.env.DATABASE_URL = TEST_DATABASE_URL ?? "postgres://unused";
+process.env.DATABASE_SCHEMA = TEST_SCHEMA;
 process.env.LOG_LEVEL = "error";
 
 const DIMENSIONS = 1536;
@@ -70,11 +75,17 @@ beforeAll(async () => {
   harness = await import("@/eval/harness");
 }, 30_000);
 
-afterAll(() => {
+afterAll(async () => {
   fs.rmSync(WORKDIR, { recursive: true, force: true });
+  if (!TEST_DATABASE_URL) return;
+  const db = await import("@/lib/db");
+  // Uniquely named and disposable, so this cannot reach anything but this
+  // file's own rows.
+  await db.query(`DROP SCHEMA IF EXISTS "${TEST_SCHEMA}" CASCADE`).catch(() => undefined);
+  await db.closeDb();
 });
 
-describe("readDirectory", () => {
+describeDb("readDirectory", () => {
   it("walks source files and prunes dependency directories", () => {
     const { rootName, files } = harness.readDirectory(REPO_DIR);
 
@@ -89,7 +100,7 @@ describe("readDirectory", () => {
   });
 });
 
-describe("runEvaluation", () => {
+describeDb("runEvaluation", () => {
   it("scores every mode and cleans up the throwaway index", async () => {
     const report = await harness.runEvaluation({
       directory: REPO_DIR,
@@ -127,12 +138,13 @@ describe("runEvaluation", () => {
     }
 
     // The eval index must not survive — otherwise it shows up in the app UI.
-    const { getDb } = await import("@/lib/db");
-    const row = getDb()
-      .prepare("SELECT COUNT(*) AS n FROM repositories WHERE id = ?")
-      .get(report.repoId) as { n: number };
-    expect(row.n).toBe(0);
-  }, 30_000);
+    const { query, tbl } = await import("@/lib/db");
+    const [row] = await query<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM ${tbl("repositories")} WHERE id = $1`,
+      [report.repoId],
+    );
+    expect(Number(row.n)).toBe(0);
+  }, 120_000);
 
   it("refuses to run against an empty directory", async () => {
     const empty = path.join(WORKDIR, "empty");
