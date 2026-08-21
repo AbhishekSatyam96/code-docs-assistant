@@ -79,7 +79,7 @@ OPENAI_API_KEY=sk-... docker compose up --build
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Changing this rebuilds the vector index |
 | `DATABASE_URL` | — | **Required.** Postgres with pgvector >= 0.8 (Neon, Supabase, RDS, local) |
 | `DATABASE_SCHEMA` | `code_docs` | Own schema, so the app can share a database without owning `public` |
-| `GITHUB_TOKEN` | — | Raises GitHub's 60/hr anonymous limit; allows private repos. Effectively required on Vercel — see [deploying](#deploying-to-vercel) |
+| `GITHUB_TOKEN` | — | Raises GitHub's 60/hr anonymous limit to 5,000/hr; required for private repos. Recommended on Vercel — see [deploying](#deploying-to-vercel) |
 | `OPENAI_BASE_URL` | — | Point at Azure OpenAI, LiteLLM, vLLM, etc. |
 
 RAG parameters (chunk size, top-k, RRF constant, context budget) all live in
@@ -780,7 +780,7 @@ one config serves both targets.
 | `OPENAI_API_KEY` | Required. |
 | `DATABASE_URL` | Required. **Use Neon's pooled endpoint** — the host containing `-pooler`. The direct endpoint has a connection ceiling that N serverless instances × 3 connections will find. |
 | `DATABASE_SCHEMA` | Optional, defaults to `code_docs`. |
-| `GITHUB_TOKEN` | **Effectively required on Vercel.** GitHub's anonymous limit is 60 requests/hour *per IP*, and serverless egress IPs are shared — so the quota is often already spent by someone else. Locally this is genuinely optional. |
+| `GITHUB_TOKEN` | Recommended. One ingestion costs one API call against a 60/hour **per-IP** anonymous budget — ample on your own machine. Serverless egress IPs are shared, though, so on Vercel that budget is shared with strangers and may already be spent. A token raises it to 5,000/hour and is required for private repos either way. |
 
 Do **not** set `TEST_DATABASE_URL` in Vercel; it exists only to let the
 integration tests run, and its absence is what keeps them from touching a real
