@@ -234,11 +234,18 @@ matcher on a repo that is itself a routing library.)
 
 ### Retrieval: hybrid + RRF
 
-**Why both retrievers.** Embeddings capture intent ("how do we authenticate
-users") but are weak on rare literal tokens — an exact identifier like
-`parseJwtPayload`, an error string, or an env var name gets averaged into a
-generic "auth-ish" vector. BM25 nails those and is useless for paraphrase.
-Developer questions are a near-even mix, so running only one loses half of them.
+**Why both retrievers — the argument.** Embeddings capture intent ("how do we
+authenticate users") but are weak on rare literal tokens: an exact identifier
+like `parseJwtPayload`, an error string, or an env var name gets averaged into
+a generic "auth-ish" vector. BM25 nails those and is useless for paraphrase.
+Developer questions are a mix of both, so running only one should lose a chunk
+of them.
+
+That was the reasoning. **My own eval does not currently support it** — dense
+retrieval alone beats the fusion on this corpus. I've left the numbers and the
+analysis in [Quality and evaluation](#quality-and-evaluation) rather than
+quietly dropping the claim, because working out *why* is more interesting than
+the result.
 
 **Why RRF and not a weighted blend.** Cosine similarity and BM25 aren't on the
 same scale, and BM25's range shifts with corpus statistics — so
@@ -388,10 +395,55 @@ you tell *which* retriever regressed rather than just that something did.
 Neighbour expansion is disabled during eval: crediting a retriever for an
 adjacent chunk of a file it already found measures nothing.
 
-> **I have not run this against a real API key** — I built and verified it
-> against a mocked embedding backend (`tests/eval.test.ts` runs the full
-> harness end to end), so the harness works, but the actual recall numbers are
-> yours to generate. Run `npm run eval` and paste the table here.
+#### Results — and the assumption they falsified
+
+Run against this repo's own `src/` (40 files → 106 chunks, 18 questions):
+
+| k | hybrid recall / MRR | **vector** recall / MRR | keyword recall / MRR |
+|---|---|---|---|
+| 3 | 88.9% / 0.806 | **94.4% / 0.880** | 77.8% / 0.685 |
+| 5 | 94.4% / 0.819 | **100% / 0.898** | 88.9% / 0.710 |
+| 10 | 100% / 0.831 | **100% / 0.898** | 94.4% / 0.716 |
+
+**Dense retrieval alone beats the hybrid, at every k.** That is the opposite of
+what I assumed when I built it, and it is the single most useful thing the eval
+told me.
+
+*Why it happens.* RRF rewards agreement between retrievers, and that is exactly
+the problem when one of them is weaker. A chunk both retrievers rank mediocrely
+— 5th and 6th — scores `1/65 + 1/66 = 0.0306`. A chunk only the dense retriever
+finds, at rank 1, scores `1/61 = 0.0164`. So a mediocre consensus outranks a
+confident correct answer, and the sparse retriever's errors get promoted.
+
+*Why I have not ripped hybrid out anyway.* Three reasons, and I want to be
+clear that the first two are criticisms of my measurement, not defences of the
+design:
+
+1. **The corpus is too homogeneous to test BM25 fairly.** 106 chunks from a
+   single TypeScript project where nearly every file discusses "chunk",
+   "query", "retrieval", "embed". IDF has almost nothing to discriminate on.
+   This is the best case for dense and close to the worst case for sparse.
+2. **The question set is semantic-heavy and its lexical questions are too
+   easy.** 13 of 18 are `semantic`; all 3 `lexical` questions pass in *every*
+   mode, so they contribute no signal at all. The queries where BM25 actually
+   wins — a rare identifier appearing in two chunks, a literal error string, an
+   env var name — are absent. That is a flaw in my dataset.
+3. **Tuning on 18 questions would be overfitting.** I could weight the fusion
+   until hybrid won this table. That would be fitting noise, and I would learn
+   nothing.
+
+The honest position: *on a small homogeneous corpus, fusion costs you ranking
+quality.* Whether it pays off on a large heterogeneous repo is untested, and I
+would want a bigger, lexically balanced set on a real multi-language codebase
+before either keeping or removing it. Weighted RRF (down-weighting the sparse
+list) is the obvious fix and is at the top of [what I'd do next](#what-id-do-next).
+
+*One bug this found.* The first run scored keyword at 0.352 MRR, and the misses
+showed it retrieving `eval/dataset.ts` — the file containing the golden
+questions. I was indexing the answer key, so every question matched it
+verbatim. Excluding the eval directory lifted keyword MRR to 0.685 and hybrid's
+to 0.806. Worth stating plainly: **my first set of numbers was wrong**, and the
+only reason I know that is that the harness prints its misses.
 
 **Testing.** 59 tests, no API key required.
 
@@ -429,6 +481,30 @@ answer is wrong the question is always "what did retrieval actually return?",
 and that has to be inspectable next to the bad answer rather than reconstructed
 from stdout. It turns "the model hallucinated" into "retrieval never returned
 that file" — different bugs, different fixes.
+
+#### What the traces say in practice
+
+A representative real run — `expressjs/express` (176 files, 438 chunks), asked
+*"How does routing work? Walk me through what happens when a request comes in."*
+
+| | |
+|---|---|
+| retrieval | 336 ms |
+| generation | 7.5 s |
+| end to end | 13.8 s |
+| prompt / completion tokens | 10,085 / 500 |
+| cost | $0.032 |
+
+Two things I only learned by looking at this:
+
+1. **Retrieval is not the latency problem — the prompt is.** 336 ms of search
+   against 7.5 s of generation. Optimising the vector index would be effort
+   spent on 2% of the wall clock.
+2. **The repo map is a large and completely static share of those 10k prompt
+   tokens.** It is byte-identical for every question about a given repo, which
+   makes prompt caching an obvious, unimplemented win — worth roughly 90% of
+   the input cost on repeat questions. That is why it is on the next-steps list
+   rather than in the "nice to have" pile.
 
 ---
 
@@ -639,22 +715,29 @@ difference between "this change feels better" and "recall went from 0.72 to
 
 Roughly in priority order:
 
-1. **Faithfulness eval.** Retrieval recall is only half the quality story. An
+1. **Settle the hybrid-vs-dense question properly.** My eval says fusion is
+   currently costing me ranking quality, but the eval is too small and too
+   semantic-heavy to be the last word. Concretely: build a 60–80 question set
+   over a large multi-language repo, with a real share of rare-identifier and
+   error-string queries; then compare equal-weight RRF, weighted RRF, and dense
+   alone. Whichever wins, I'd want it to win on data rather than on the
+   argument I found convincing while writing the code.
+2. **Faithfulness eval.** Retrieval recall is only half the quality story. An
    LLM-judge pass checking that every claim traces to a cited chunk is the
    metric that correlates with trust, and I don't have it.
-2. **tree-sitter chunking.** The regex boundary detection is the weakest part
+3. **tree-sitter chunking.** The regex boundary detection is the weakest part
    of the pipeline. A real parse also unlocks a symbol graph.
-3. **A symbol index.** Extract definitions and call sites into a table, and let
+4. **A symbol index.** Extract definitions and call sites into a table, and let
    "where is X called?" be an exact lookup instead of a similarity search. This
    is the highest-value feature I didn't build — it's the question developers
    actually ask most.
-4. **Prompt caching for the repo map.** It's byte-identical across every
+5. **Prompt caching for the repo map.** It's byte-identical across every
    question for a repo. Straightforward cost win.
-5. **Job queue + incremental re-indexing** (see productionising).
-6. **A reranker.** A cross-encoder over the top ~30 fused candidates would
+6. **Job queue + incremental re-indexing** (see productionising).
+7. **A reranker.** A cross-encoder over the top ~30 fused candidates would
    likely beat every parameter tweak I could make to fusion.
-7. **Multi-repo questions**, and repo-to-repo comparison.
-8. **Answer-level caching** keyed on (repo commit, normalised question).
+8. **Multi-repo questions**, and repo-to-repo comparison.
+9. **Answer-level caching** keyed on (repo commit, normalised question).
 
 ---
 
@@ -662,6 +745,16 @@ Roughly in priority order:
 
 Acknowledged rather than handled:
 
+- **The eval set is too small and too semantic-heavy** to settle the
+  hybrid-vs-dense question: 18 questions over 106 chunks, of which the 3
+  lexical ones pass in every mode and therefore carry no signal. See
+  [Results](#results--and-the-assumption-they-falsified).
+- **Test files crowd out implementation.** On `expressjs/express`, most of the
+  top retrieved chunks for a routing question came from `test/`. Not strictly
+  wrong — a test suite is a precise description of behaviour — but the user
+  usually wants `lib/router/index.js` first. A rank penalty for `test/`,
+  `spec/`, `__tests__/` is the obvious fix; I have not added it because my eval
+  set cannot currently measure whether it helps or hurts.
 - **Regex chunk boundaries** misfire inside string literals and can't see
   nesting depth.
 - **Route detection** is pattern matching — false positives from test files

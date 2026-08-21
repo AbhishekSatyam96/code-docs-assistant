@@ -11,7 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "eval": "tsx --env-file=.env src/eval/run.ts",
+    "eval": "tsx --conditions=react-server --env-file=.env src/eval/run.ts",
     "check": "npm run typecheck && npm run lint && npm run test"
   },
   "dependencies": {

@@ -20,6 +20,9 @@ async function main() {
 
   const directory = path.resolve(flag("dir") ?? "./src");
   const k = Number(flag("k") ?? 10);
+  // The golden questions live in `eval/dataset.ts`. Indexing them would let
+  // every question match the answer key verbatim, so they are held out.
+  const exclude = (flag("exclude") ?? "eval").split(",").filter(Boolean);
 
   if (!process.env.OPENAI_API_KEY) {
     console.error("OPENAI_API_KEY is not set. Copy .env.example to .env first.");
@@ -35,6 +38,7 @@ async function main() {
   const report = await runEvaluation({
     directory,
     k,
+    exclude,
     onProgress: (message) => console.log(`  ${message}`),
   });
 

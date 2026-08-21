@@ -35,16 +35,30 @@ export interface EvalReport {
   modes: ModeReport[];
 }
 
-/** Read a directory into the shape the upload ingestion path expects. */
-export function readDirectory(root: string, maxFiles = 3_000) {
+/**
+ * Read a directory into the shape the upload ingestion path expects.
+ *
+ * `exclude` holds path prefixes to skip. It exists because of a real
+ * measurement bug: when this eval runs against its own repository, the golden
+ * question set in `src/eval/dataset.ts` is itself an indexable file. Every
+ * question then matches that file verbatim, BM25 ranks the answer key above
+ * the actual answer, and the scores measure nothing but leakage. Excluding the
+ * eval directory is the fix — you do not index the answer key.
+ */
+export function readDirectory(root: string, maxFiles = 3_000, exclude: string[] = []) {
   const files: Array<{ path: string; content: string }> = [];
   const rootName = path.basename(path.resolve(root));
+
+  const isExcluded = (relative: string) =>
+    exclude.some((prefix) => relative === prefix || relative.startsWith(`${prefix}/`));
 
   const walk = (dir: string) => {
     if (files.length >= maxFiles) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const absolute = path.join(dir, entry.name);
       const relative = path.relative(root, absolute).split(path.sep).join("/");
+
+      if (isExcluded(relative)) continue;
 
       if (entry.isDirectory()) {
         // Cheap prune so we never descend into node_modules at all.
@@ -86,6 +100,8 @@ export async function runEvaluation(options: {
   k?: number;
   modes?: RetrievalMode[];
   questions?: EvalQuestion[];
+  /** Path prefixes, relative to `directory`, to keep out of the index. */
+  exclude?: string[];
   onProgress?: (message: string) => void;
 }): Promise<EvalReport> {
   const k = options.k ?? 10;
@@ -93,7 +109,7 @@ export async function runEvaluation(options: {
   const questions = options.questions ?? EVAL_QUESTIONS;
   const report = options.onProgress ?? (() => {});
 
-  const { rootName, files } = readDirectory(options.directory);
+  const { rootName, files } = readDirectory(options.directory, 3_000, options.exclude ?? []);
   if (files.length === 0) {
     throw new Error(`No indexable files found under ${options.directory}`);
   }

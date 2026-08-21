@@ -5,9 +5,26 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),
-      // `server-only` throws when imported outside a React Server Component.
-      // Tests exercise the pure logic in those modules, so it is stubbed.
-      "server-only": path.resolve(import.meta.dirname, "./tests/stubs/server-only.ts"),
+    },
+    /**
+     * `server-only` throws on import unless resolved under the `react-server`
+     * condition, which maps it to an empty module. Declaring the condition —
+     * rather than stubbing the package with an alias — means tests resolve it
+     * exactly the way `npm run eval` does.
+     *
+     * That difference was not academic: an alias-based stub hid a crash in the
+     * eval CLI, because the tests never loaded the real package.
+     */
+    conditions: ["react-server", "node", "import", "default"],
+  },
+  // Vitest runs test files through its SSR pipeline, which resolves bare
+  // imports with `ssr.resolve.conditions` rather than the client-side list
+  // above. Both are set so the condition applies whichever path a module
+  // takes.
+  ssr: {
+    resolve: {
+      conditions: ["react-server", "node", "import", "default"],
+      externalConditions: ["react-server", "node", "import", "default"],
     },
   },
   test: {
