@@ -83,48 +83,111 @@ export function getDb(): Promise<Pool> {
   return ready.then(() => pool);
 }
 
+/**
+ * Serialise schema creation across every process touching this database.
+ *
+ * `IF NOT EXISTS` reads as concurrency-safe and is not: Postgres checks, then
+ * creates, without holding a lock between the two. Two callers that both find
+ * the extension missing will both try to create it, and one gets
+ * `duplicate key value violates unique constraint "pg_extension_name_index"`.
+ * Two Vitest workers found this immediately; N serverless instances cold-
+ * starting against a fresh database would find it in production.
+ *
+ * `pg_advisory_xact_lock` rather than the session-level `pg_advisory_lock`,
+ * because the recommended Neon endpoint is the PgBouncer pooler running in
+ * transaction mode — where a session-scoped lock may be taken on one backend
+ * and released on another. Transaction-scoped locks are released at COMMIT,
+ * which is exactly the guarantee transaction pooling preserves.
+ *
+ * The key is derived from the schema name so two schemas can bootstrap in
+ * parallel without blocking each other.
+ */
+function advisoryLockKey(schema: string): number {
+  // FNV-1a, 32-bit. `pg_advisory_xact_lock` takes a bigint, but a 32-bit key is
+  // ample: the only cost of a collision is that two *different* schemas would
+  // serialise their bootstraps behind each other, which is a few milliseconds
+  // once per process — not a correctness problem.
+  const input = `code-docs-assistant:${schema}`;
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  // `|0` keeps it a signed 32-bit integer, comfortably inside bigint range.
+  return hash | 0;
+}
+
+/** Run `fn` in a transaction holding the schema's bootstrap lock. */
+async function withSchemaLock<T>(
+  pool: Pool,
+  schema: string,
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock($1)", [advisoryLockKey(schema)]);
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function bootstrap(pool: Pool): Promise<void> {
   const schema = env().DATABASE_SCHEMA;
   const model = env().OPENAI_EMBEDDING_MODEL;
   const dims = embeddingDimensions(model);
 
-  await pool.query(schemaSql());
+  // The whole bootstrap — create, inspect, possibly rebuild, record — runs
+  // under one lock. Splitting it would reopen the race in the rebuild branch:
+  // two instances could both read the old model, both drop `chunks`, and the
+  // second would drop the table the first had just repopulated.
+  //
+  // DDL is transactional in Postgres, so this applies whole or not at all.
+  const pgvector = await withSchemaLock(pool, schema, async (client) => {
+    await client.query(schemaSql());
 
-  // If the embedding model changed, every stored vector is meaningless —
-  // vectors from different models live in unrelated coordinate spaces, so
-  // cosine distance between them still sorts, still looks plausible, and is
-  // entirely garbage. Drop the rows rather than serve nonsense neighbours.
-  const meta = await pool.query<{ model: string; dimensions: number }>(
-    `SELECT model, dimensions FROM "${schema}".vector_meta WHERE id = 1`,
-  );
-  const previous = meta.rows[0];
-
-  if (previous && previous.dimensions !== dims) {
-    logger.warn("embedding model changed — rebuilding vector index", {
-      from: previous.model,
-      to: model,
-    });
-    await pool.query(`DROP TABLE IF EXISTS "${schema}".chunks CASCADE`);
-    await pool.query(
-      `UPDATE "${schema}".repositories
-       SET status = 'failed', status_detail = 'Embedding model changed — re-index required'`,
+    // If the embedding model changed, every stored vector is meaningless —
+    // vectors from different models live in unrelated coordinate spaces, so
+    // cosine distance between them still sorts, still looks plausible, and is
+    // entirely garbage. Drop the rows rather than serve nonsense neighbours.
+    const meta = await client.query<{ model: string; dimensions: number }>(
+      `SELECT model, dimensions FROM "${schema}".vector_meta WHERE id = 1`,
     );
-    await pool.query(schemaSql());
-  }
+    const previous = meta.rows[0];
 
-  await pool.query(
-    `INSERT INTO "${schema}".vector_meta (id, model, dimensions) VALUES (1, $1, $2)
-     ON CONFLICT (id) DO UPDATE SET model = EXCLUDED.model, dimensions = EXCLUDED.dimensions`,
-    [model, dims],
-  );
+    if (previous && previous.dimensions !== dims) {
+      logger.warn("embedding model changed — rebuilding vector index", {
+        from: previous.model,
+        to: model,
+      });
+      await client.query(`DROP TABLE IF EXISTS "${schema}".chunks CASCADE`);
+      await client.query(
+        `UPDATE "${schema}".repositories
+            SET status = 'failed',
+                status_detail = 'Embedding model changed — re-index required'`,
+      );
+      await client.query(schemaSql());
+    }
 
-  const version = await pool.query<{ v: string }>(
-    "SELECT extversion AS v FROM pg_extension WHERE extname = 'vector'",
-  );
-  logger.info("database ready", {
-    schema,
-    pgvector: version.rows[0]?.v ?? "unknown",
+    await client.query(
+      `INSERT INTO "${schema}".vector_meta (id, model, dimensions) VALUES (1, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET model = EXCLUDED.model, dimensions = EXCLUDED.dimensions`,
+      [model, dims],
+    );
+
+    const version = await client.query<{ v: string }>(
+      "SELECT extversion AS v FROM pg_extension WHERE extname = 'vector'",
+    );
+    return version.rows[0]?.v ?? "unknown";
   });
+
+  logger.info("database ready", { schema, pgvector });
 }
 
 /** Convenience wrapper so callers do not repeat `(await getDb()).query(...)`. */
