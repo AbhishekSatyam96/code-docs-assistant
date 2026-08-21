@@ -51,7 +51,7 @@ export function env(): Env {
   return cached;
 }
 
-/** Embedding dimensions, keyed by model. Used to size the vec0 table. */
+/** Embedding dimensions, keyed by model. Sizes the `vector(n)` column. */
 const EMBEDDING_DIMS: Record<string, number> = {
   "text-embedding-3-small": 1536,
   "text-embedding-3-large": 3072,
@@ -120,7 +120,7 @@ export const LIMITS = {
 } as const;
 
 /** USD per 1M tokens. Used for the cost column in the trace log. */
-export const PRICING: Record<string, { input: number; output: number }> = {
+const PRICING: Record<string, { input: number; output: number }> = {
   "gpt-4o": { input: 2.5, output: 10 },
   "gpt-4o-mini": { input: 0.15, output: 0.6 },
   "gpt-4.1": { input: 2.0, output: 8 },

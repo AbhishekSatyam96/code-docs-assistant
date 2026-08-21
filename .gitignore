@@ -40,11 +40,5 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Local index + eval databases
-/data
-*.db
-*.db-wal
-*.db-shm
-
 # Keep the template committed
 !.env.example

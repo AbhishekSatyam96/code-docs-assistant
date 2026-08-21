@@ -40,7 +40,11 @@ RUN groupadd --system --gid 1001 nodejs \
 # static tracing could prove are needed.
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+
+# No `COPY /app/public` — this project has no static assets, so the directory
+# does not exist and the COPY would fail the build. The favicon lives at
+# `src/app/favicon.ico` under the App Router file convention, which the build
+# emits itself. Re-add the line if you introduce a `public/` directory.
 
 # `pg` is listed in serverExternalPackages, so it is required at runtime rather
 # than bundled — which means it has to actually be present in the image.

@@ -74,12 +74,6 @@ export const PulseIcon = (p: IconProps) => (
   </Icon>
 );
 
-export const CheckIcon = (p: IconProps) => (
-  <Icon {...p}>
-    <path d="M4.5 12.5 9 17l10.5-10.5" />
-  </Icon>
-);
-
 export const AlertIcon = (p: IconProps) => (
   <Icon {...p}>
     <path d="M12 8.5v5M12 16.8v.2" />
@@ -126,12 +120,6 @@ export const CopyIcon = (p: IconProps) => (
   <Icon {...p}>
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M5 15V6a2 2 0 0 1 2-2h8" />
-  </Icon>
-);
-
-export const ChevronIcon = (p: IconProps) => (
-  <Icon {...p}>
-    <path d="m9 6 6 6-6 6" />
   </Icon>
 );
 

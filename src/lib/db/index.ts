@@ -73,7 +73,7 @@ function createPool(): Pool {
  * concurrent first-requests await one migration instead of racing to run it
  * N times.
  */
-export function getDb(): Promise<Pool> {
+function getDb(): Promise<Pool> {
   const cached = (globalThis as GlobalWithPool)[GLOBAL_KEY];
   if (cached) return cached.ready.then(() => cached.pool);
 
