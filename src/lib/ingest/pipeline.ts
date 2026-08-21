@@ -14,6 +14,7 @@ import {
   loadGitHubRepo,
   loadUploadedFiles,
   type LoadedSource,
+  type SourceFile,
 } from "./sources";
 
 export interface StartIngestionInput {
@@ -92,37 +93,38 @@ async function runIngestion(repoId: string, input: StartIngestionInput): Promise
   await setStatus(repoId, "indexing", `Chunking ${source.files.length} files`, 0.12);
 
   // ---- Files + chunks -----------------------------------------------------
+  //
+  // Chunking is pure CPU, so it all happens before any SQL is issued. The
+  // original version interleaved them — chunk a file, insert it, insert its
+  // chunks — which cost two network round trips *per file*. On a 176-file repo
+  // against a database in another region that was ~350 round trips and ~28
+  // seconds of pure latency. Batching the writes turns it into a handful.
   interface PendingChunk {
     id: number;
     embedText: string;
   }
+
+  const prepared = source.files.flatMap((file) => {
+    const spec = detectLanguage(file.path);
+    if (!spec) return [];
+    const chunks = chunkFile(file.path, file.content);
+    if (chunks.length === 0) return [];
+    return [{ file, language: spec.language, chunks }];
+  });
+
   const pending: PendingChunk[] = [];
 
   await transaction(async (client) => {
-    for (const file of source.files) {
-      const spec = detectLanguage(file.path);
-      if (!spec) continue;
+    const fileIds = await insertFiles(client, repoId, prepared);
 
-      const chunks: CodeChunk[] = chunkFile(file.path, file.content);
-      if (chunks.length === 0) continue;
+    const allChunks = prepared.flatMap(({ file, chunks }) =>
+      chunks.map((chunk) => ({ fileId: fileIds.get(file.path)!, chunk })),
+    );
 
-      const fileResult = await client.query<{ id: string }>(
-        `INSERT INTO ${tbl("files")} (repo_id, path, language, bytes, loc, content)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [
-          repoId,
-          file.path,
-          spec.language,
-          file.bytes,
-          file.content.split("\n").length,
-          file.content,
-        ],
-      );
-      const fileId = Number(fileResult.rows[0].id);
-
-      const ids = await insertChunkBatch(client, repoId, fileId, chunks);
-      chunks.forEach((chunk, index) => {
-        pending.push({ id: ids[index], embedText: chunk.embedText });
+    for (const batch of batched(allChunks, CHUNK_INSERT_BATCH)) {
+      const ids = await insertChunkBatch(client, repoId, batch);
+      batch.forEach((entry, index) => {
+        pending.push({ id: ids[index], embedText: entry.chunk.embedText });
       });
     }
   });
@@ -184,31 +186,112 @@ async function runIngestion(repoId: string, input: StartIngestionInput): Promise
 }
 
 /**
- * Insert a file's chunks in one statement.
+ * Rows per multi-row INSERT.
+ *
+ * Bounded by Postgres's hard limit of 65535 bind parameters per statement:
+ * chunks bind 10 columns, so 300 rows is 3,000 parameters — comfortably clear
+ * while still collapsing thousands of round trips into a handful.
+ */
+const CHUNK_INSERT_BATCH = 300;
+
+/**
+ * Files are batched by *payload size* rather than row count, because `content`
+ * holds an entire source file (up to 256 KB). 200 rows of that would be a
+ * 50 MB statement; 4 MB keeps each request sane while still batching heavily.
+ */
+const FILE_INSERT_MAX_BYTES = 4 * 1024 * 1024;
+const FILE_INSERT_MAX_ROWS = 200;
+
+function* batched<T>(items: T[], size: number): Generator<T[]> {
+  for (let i = 0; i < items.length; i += size) yield items.slice(i, i + size);
+}
+
+/** Build the `($1, $2, …), ($3, $4, …)` placeholder list for a multi-row VALUES. */
+function placeholders(rowCount: number, columns: number): string {
+  const rows: string[] = [];
+  for (let row = 0; row < rowCount; row++) {
+    const base = row * columns;
+    const cells = Array.from({ length: columns }, (_, c) => `$${base + c + 1}`);
+    rows.push(`(${cells.join(", ")})`);
+  }
+  return rows.join(", ");
+}
+
+/**
+ * Insert every file, returning a path → id map.
+ *
+ * `RETURNING id, path` rather than relying on row order: the mapping is then
+ * explicit and correct regardless of how Postgres orders the returned rows,
+ * which matters because these ids become the foreign key for every chunk.
+ */
+async function insertFiles(
+  client: PoolClient,
+  repoId: string,
+  prepared: Array<{ file: SourceFile; language: string; chunks: CodeChunk[] }>,
+): Promise<Map<string, number>> {
+  const ids = new Map<string, number>();
+  const COLUMNS = 6;
+
+  let batch: typeof prepared = [];
+  let bytes = 0;
+
+  const flush = async () => {
+    if (batch.length === 0) return;
+    const params: unknown[] = [];
+    for (const { file, language } of batch) {
+      params.push(
+        repoId,
+        file.path,
+        language,
+        file.bytes,
+        file.content.split("\n").length,
+        file.content,
+      );
+    }
+    const result = await client.query<{ id: string; path: string }>(
+      `INSERT INTO ${tbl("files")} (repo_id, path, language, bytes, loc, content)
+       VALUES ${placeholders(batch.length, COLUMNS)}
+       RETURNING id, path`,
+      params,
+    );
+    for (const row of result.rows) ids.set(row.path, Number(row.id));
+    batch = [];
+    bytes = 0;
+  };
+
+  for (const entry of prepared) {
+    if (
+      batch.length >= FILE_INSERT_MAX_ROWS ||
+      (bytes > 0 && bytes + entry.file.bytes > FILE_INSERT_MAX_BYTES)
+    ) {
+      await flush();
+    }
+    batch.push(entry);
+    bytes += entry.file.bytes;
+  }
+  await flush();
+
+  return ids;
+}
+
+/**
+ * Insert a batch of chunks in one statement.
  *
  * The SQLite version could afford a prepared statement per row because it was
  * an in-process function call. Against a hosted database that is one network
- * round trip per chunk — on a 3,000-chunk repo, tens of thousands of
- * milliseconds spent entirely on latency. A multi-row VALUES list collapses it
- * to one round trip per file, and `RETURNING id` preserves the mapping from
- * row back to chunk so the embedding step knows what to attach where.
+ * round trip per chunk. `RETURNING id` preserves insertion order for a
+ * multi-row VALUES list, which is what lets the caller zip the ids back onto
+ * the chunks by position so the embedding step knows what to attach where.
  */
 async function insertChunkBatch(
   client: PoolClient,
   repoId: string,
-  fileId: number,
-  chunks: CodeChunk[],
+  entries: Array<{ fileId: number; chunk: CodeChunk }>,
 ): Promise<number[]> {
   const COLUMNS = 10;
   const params: unknown[] = [];
-  const rows: string[] = [];
 
-  chunks.forEach((chunk, index) => {
-    const base = index * COLUMNS;
-    rows.push(
-      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, ` +
-        `$${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`,
-    );
+  for (const { fileId, chunk } of entries) {
     params.push(
       repoId,
       fileId,
@@ -221,18 +304,16 @@ async function insertChunkBatch(
       chunk.content,
       chunk.embedText,
     );
-  });
+  }
 
   const result = await client.query<{ id: string }>(
     `INSERT INTO ${tbl("chunks")}
        (repo_id, file_id, ordinal, start_line, end_line, symbol, kind, token_count, content, embed_text)
-     VALUES ${rows.join(", ")}
+     VALUES ${placeholders(entries.length, COLUMNS)}
      RETURNING id`,
     params,
   );
 
-  // Postgres returns RETURNING rows in insertion order for a multi-row VALUES
-  // list, which is what lets us zip these back onto `chunks` by position.
   return result.rows.map((row) => Number(row.id));
 }
 
@@ -246,25 +327,31 @@ async function insertChunkBatch(
 async function writeEmbeddings(
   entries: Array<{ id: number; vector: number[] }>,
 ): Promise<void> {
-  if (entries.length === 0) return;
+  // Split rather than sending one enormous statement. Each 1536-dimension
+  // literal is ~14 KB, so 384 of them in a single UPDATE is a 5 MB statement
+  // that Postgres must receive and parse in one go. 64 rows keeps each request
+  // under ~1 MB, which streams and pipelines far better over a long link.
+  for (const batch of batched(entries, EMBEDDING_WRITE_BATCH)) {
+    const params: unknown[] = [];
+    const rows: string[] = [];
 
-  const params: unknown[] = [];
-  const rows: string[] = [];
+    batch.forEach((entry, index) => {
+      const base = index * 2;
+      rows.push(`($${base + 1}::bigint, $${base + 2}::vector)`);
+      params.push(entry.id, toVectorLiteral(entry.vector));
+    });
 
-  entries.forEach((entry, index) => {
-    const base = index * 2;
-    rows.push(`($${base + 1}::bigint, $${base + 2}::vector)`);
-    params.push(entry.id, toVectorLiteral(entry.vector));
-  });
-
-  await query(
-    `UPDATE ${tbl("chunks")} AS c
-        SET embedding = v.embedding
-       FROM (VALUES ${rows.join(", ")}) AS v(id, embedding)
-      WHERE c.id = v.id`,
-    params,
-  );
+    await query(
+      `UPDATE ${tbl("chunks")} AS c
+          SET embedding = v.embedding
+         FROM (VALUES ${rows.join(", ")}) AS v(id, embedding)
+        WHERE c.id = v.id`,
+      params,
+    );
+  }
 }
+
+const EMBEDDING_WRITE_BATCH = 64;
 
 async function setStatus(
   repoId: string,

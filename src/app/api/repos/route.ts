@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { z } from "zod";
 
 import { checkRateLimit, clientKey } from "@/lib/guardrails/rate-limit";
@@ -8,6 +8,17 @@ import { logger } from "@/lib/observability/logger";
 import { listRepositories } from "@/lib/repos";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+/**
+ * Indexing continues after this route responds, so the function has to stay
+ * alive well past the 202 — see the `after()` call in POST.
+ *
+ * 60s is the ceiling on Vercel's Hobby plan. Raise it to 300 on Pro if you
+ * index large repositories; the honest constraint is documented in the README,
+ * along with why a job queue is the real fix.
+ */
+export const maxDuration = 60;
 
 const GitHubBody = z.object({
   sourceType: z.literal("github"),
@@ -63,16 +74,30 @@ export async function POST(request: Request) {
       // Validate the URL synchronously so a typo returns 400 immediately
       // instead of surfacing as a failed background job seconds later.
       parseGitHubUrl(parsed.data.url);
-      const { id } = await startIngestion({ sourceType: "github", sourceRef: parsed.data.url });
-      return NextResponse.json({ id }, { status: 202 });
     }
 
-    const { id } = await startIngestion({
-      sourceType: "upload",
-      sourceRef: parsed.data.name,
-      files: parsed.data.files,
-    });
-    return NextResponse.json({ id }, { status: 202 });
+    const started =
+      parsed.data.sourceType === "github"
+        ? await startIngestion({ sourceType: "github", sourceRef: parsed.data.url })
+        : await startIngestion({
+            sourceType: "upload",
+            sourceRef: parsed.data.name,
+            files: parsed.data.files,
+          });
+
+    // Keep the serverless function alive until indexing finishes.
+    //
+    // Without this the platform is free to freeze or reclaim the instance the
+    // moment the 202 is written, killing indexing part-way and leaving a row
+    // stuck in `indexing` forever. `after()` runs the callback once the
+    // response is sent but keeps the invocation billed and alive, bounded by
+    // `maxDuration` above.
+    //
+    // Self-hosted (Docker, a VM) this is a no-op — the process was never going
+    // to be frozen. It costs nothing there and is essential on Vercel.
+    after(() => started.done);
+
+    return NextResponse.json({ id: started.id }, { status: 202 });
   } catch (error) {
     if (error instanceof IngestError) {
       return NextResponse.json({ error: error.message }, { status: error.status });

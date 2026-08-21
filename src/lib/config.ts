@@ -103,6 +103,13 @@ export const INGEST = {
   maxTotalBytes: 40 * 1024 * 1024,
   /** Embedding requests are batched; 96 keeps each request well under limits. */
   embeddingBatchSize: 96,
+  /**
+   * How many embedding requests are in flight at once. Four is a deliberate
+   * middle: it cuts a five-batch repo from ~30s of serial waiting to well
+   * under half that, while staying far enough below OpenAI's rate limits that
+   * a 429 (and the SDK's backoff) never costs more than the parallelism saved.
+   */
+  embeddingConcurrency: 4,
 } as const;
 
 export const LIMITS = {

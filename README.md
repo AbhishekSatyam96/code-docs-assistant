@@ -24,6 +24,7 @@ used.
   - [Observability](#observability)
 - [Key technical decisions](#key-technical-decisions)
 - [Productionising this](#productionising-this)
+- [Deploying to Vercel](#deploying-to-vercel)
 - [Engineering standards](#engineering-standards-kept-and-skipped)
 - [How I used AI tools](#how-i-used-ai-tools)
 - [What I'd do next](#what-id-do-next)
@@ -78,7 +79,7 @@ OPENAI_API_KEY=sk-... docker compose up --build
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Changing this rebuilds the vector index |
 | `DATABASE_URL` | — | **Required.** Postgres with pgvector >= 0.8 (Neon, Supabase, RDS, local) |
 | `DATABASE_SCHEMA` | `code_docs` | Own schema, so the app can share a database without owning `public` |
-| `GITHUB_TOKEN` | — | Raises GitHub's 60/hr anonymous limit; allows private repos |
+| `GITHUB_TOKEN` | — | Raises GitHub's 60/hr anonymous limit; allows private repos. Effectively required on Vercel — see [deploying](#deploying-to-vercel) |
 | `OPENAI_BASE_URL` | — | Point at Azure OpenAI, LiteLLM, vLLM, etc. |
 
 RAG parameters (chunk size, top-k, RRF constant, context budget) all live in
@@ -642,9 +643,12 @@ keep Postgres for metadata. I would not start there.
 
 ### 2. Ingestion has to become a real job queue
 
-Today indexing runs as a detached promise in the request process. It dies with
-the process, can't be retried, and can't be observed across replicas. This is
-the single biggest gap.
+Today indexing runs as a detached promise in the request process, kept alive
+past the response by [`after()`](https://nextjs.org/docs/app/api-reference/functions/after).
+That is enough to make it work on a serverless host — see
+[Deploying to Vercel](#deploying-to-vercel) — but it dies with the process,
+can't be retried, and can't be observed across replicas. This is the single
+biggest gap.
 
 Production shape: `POST /api/repos` writes a row and publishes to a queue
 (SQS + Lambda/Fargate, Cloud Tasks + Cloud Run, or Azure Service Bus). Workers
@@ -700,6 +704,104 @@ touches ingestion or retrieval, and fail the build on a recall regression beyond
 a threshold. Plus an LLM-as-judge pass over answer *faithfulness* (does every
 claim trace to a cited chunk?) — that's the metric that actually correlates with
 user trust, and it's the biggest quality gap in what I've built.
+
+---
+
+---
+
+## Deploying to Vercel
+
+The app runs on Vercel as-is. Four things were needed to get there, and each is
+worth knowing because they are the parts a "just push it" deploy gets wrong.
+
+### 1. Background indexing has to be kept alive
+
+`POST /api/repos` returns `202` immediately and indexes in the background. On a
+long-lived server that just works. On a serverless host the instance can be
+frozen or reclaimed the moment the response is written, which kills indexing
+part-way and leaves a repository stuck in `indexing` forever.
+
+The fix is `after()` from `next/server`, which runs a callback once the response
+is sent while keeping the invocation alive:
+
+```ts
+const started = await startIngestion(input);
+after(() => started.done);
+return NextResponse.json({ id: started.id }, { status: 202 });
+```
+
+It is a no-op when self-hosted — that process was never going to be frozen — so
+one code path serves both.
+
+### 2. `maxDuration` bounds the whole thing
+
+`after()` does not grant unlimited time; the callback is bounded by the route's
+`maxDuration`. `/api/repos` sets **60 s**, which is the ceiling on Vercel's
+Hobby plan. On Pro you can raise it to 300.
+
+That number is a real constraint, not a formality — which is why the next
+section exists.
+
+### 3. Ingestion had to get roughly twice as fast
+
+Indexing `expressjs/express` (176 files → 438 chunks) originally took **~45 s**
+against Neon in `ap-southeast-1`. With a 60 s ceiling that leaves no margin, and
+a larger repository simply fails. Profiling found the time was almost entirely
+network latency and payload size, not compute:
+
+| Fix | What it was | Why it was slow |
+|---|---|---|
+| **Batch file inserts** | One `INSERT` per file, interleaved with chunking | 176 files × 2 statements ≈ 350 round trips ≈ 28 s of pure latency. Now: chunk everything in memory, then multi-row `INSERT … RETURNING id, path`. |
+| **Parallel embedding calls** | Five sequential OpenAI requests | Independent requests serialised by a `for` loop. Now four in flight (`INGEST.embeddingConcurrency`). Measured: 7.5 s → 3.1 s. |
+| **Round vector literals** | Full float64 text | pgvector stores **float4**, so ~19 characters per dimension went over the wire and most were discarded on arrival. A 1536-dim literal is 29 KB; a 438-chunk repo shipped **12.9 MB** of vector text. Eight decimal places halves it. |
+| **Split embedding writes** | 384 vectors per `UPDATE` | A single ~5 MB statement. Now 64 rows (~1 MB), which streams and pipelines far better. |
+
+Result: **45 s → 27 s**, with real headroom under the Hobby limit.
+
+The rounding is the one that could plausibly have hurt quality, so it was
+checked rather than assumed: `npm run eval` scored dense retrieval at
+**94.4% recall@3 / 0.861 MRR both before and after** — identical, exactly as
+float4's precision predicts.
+
+**This is still a ceiling, not a solution.** A repository several times the size
+of Express will exceed 60 s and fail. The honest fix is the job queue in the
+section above; everything here just buys enough room for realistic inputs.
+
+### 4. `output: "standalone"` must not be set on Vercel
+
+It is right for the Docker image and wrong for Vercel, which supplies its own
+build adapter. `next.config.ts` keys it off the `VERCEL` environment variable so
+one config serves both targets.
+
+### Environment variables
+
+| Variable | Notes |
+|---|---|
+| `OPENAI_API_KEY` | Required. |
+| `DATABASE_URL` | Required. **Use Neon's pooled endpoint** — the host containing `-pooler`. The direct endpoint has a connection ceiling that N serverless instances × 3 connections will find. |
+| `DATABASE_SCHEMA` | Optional, defaults to `code_docs`. |
+| `GITHUB_TOKEN` | **Effectively required on Vercel.** GitHub's anonymous limit is 60 requests/hour *per IP*, and serverless egress IPs are shared — so the quota is often already spent by someone else. Locally this is genuinely optional. |
+
+Do **not** set `TEST_DATABASE_URL` in Vercel; it exists only to let the
+integration tests run, and its absence is what keeps them from touching a real
+index.
+
+### What is still wrong on Vercel
+
+Being explicit, because these are properties of the deployment rather than bugs:
+
+- **No auth.** Anyone with the URL sees every indexed repository, can read any
+  file through `/api/files`, and can see every question and its cost. Fine
+  behind a preview URL you control; not fine public.
+- **Rate limiting is per-instance.** The token bucket lives in process memory,
+  so it resets on every cold start and does not coordinate across instances.
+  It protects against a runaway tab, not against abuse. Redis (Upstash) is the
+  fix.
+- **Cold starts pay for schema bootstrap.** The first request after an idle
+  period takes the advisory lock and runs the `CREATE … IF NOT EXISTS` pass.
+  It is idempotent and fast, but it is not free.
+- **Neon scales to zero.** After inactivity the first query wakes the compute,
+  adding a second or two. Expected, and invisible once warm.
 
 ---
 

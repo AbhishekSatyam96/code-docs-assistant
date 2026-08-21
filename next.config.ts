@@ -1,9 +1,11 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // `standalone` emits a self-contained server bundle, which keeps the
-  // production Docker image small (no full node_modules copy).
-  output: "standalone",
+  // `standalone` emits a self-contained server bundle, which keeps the Docker
+  // image small. Vercel must NOT get it — the platform supplies its own build
+  // adapter, and forcing standalone output fights it. `VERCEL` is set
+  // automatically in their build environment.
+  output: process.env.VERCEL ? undefined : "standalone",
 
   // `pg` is CommonJS and does `class Pool extends require("pg-pool")`. Bundled,
   // that require can resolve to an ES module namespace object, and extending

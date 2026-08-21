@@ -224,12 +224,36 @@ export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Pr
 }
 
 /**
+ * Decimal places kept when serialising a vector.
+ *
+ * pgvector's `vector` type stores **float4** — 4 bytes per dimension, ~7
+ * significant digits. OpenAI returns full float64 text, so a raw
+ * `values.join(",")` ships ~19 characters per dimension of which Postgres
+ * discards more than half on arrival.
+ *
+ * That waste is not academic: at 1536 dimensions a full-precision literal is
+ * ~29 KB, so a 438-chunk repository uploads **12.9 MB** of vector text. Against
+ * a database in another region that was measured at ~31 s — by far the largest
+ * cost in ingestion, larger than every OpenAI call combined. Eight decimal
+ * places halves the payload while staying at or beyond float4's own precision
+ * for the magnitudes embeddings actually produce (|x| < 1).
+ */
+const VECTOR_PRECISION = 8;
+
+/**
  * pgvector accepts its input as the text form `[0.1,0.2,...]` and casts.
  * There is no binary protocol for it in `pg`, so this is the representation on
  * both the write and read paths.
  */
 export function toVectorLiteral(values: number[]): string {
-  return `[${values.join(",")}]`;
+  let out = "[";
+  for (let i = 0; i < values.length; i++) {
+    if (i > 0) out += ",";
+    // `toFixed` rather than template interpolation: it avoids exponent
+    // notation ("1e-7"), which pgvector's parser rejects.
+    out += values[i].toFixed(VECTOR_PRECISION);
+  }
+  return out + "]";
 }
 
 /** Schema-qualified table name for use in SQL templates. */
