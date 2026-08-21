@@ -1,0 +1,16 @@
+node_modules
+.next
+.git
+.github
+data
+coverage
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+npm-debug.log*
+.DS_Store
+docs/screenshots
+README.md

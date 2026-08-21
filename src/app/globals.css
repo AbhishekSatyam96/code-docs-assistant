@@ -1,0 +1,275 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens.
+ *
+ * A single dark theme, committed to deliberately rather than shipping two
+ * half-finished ones. This is a developer tool that sits next to an editor all
+ * day, and the palette is tuned for long code-reading sessions: a near-black
+ * base with a slight blue cast, low-chroma surfaces so syntax highlighting
+ * stays the most colourful thing on screen, and one accent used only for
+ * interactive affordances.
+ */
+@theme {
+  --color-base: #0a0c10;
+  --color-surface: #12151b;
+  --color-surface-2: #171b23;
+  --color-surface-3: #1e232d;
+
+  --color-line: #232936;
+  --color-line-strong: #2f3746;
+
+  --color-ink: #e8ecf4;
+  --color-ink-muted: #98a2b8;
+  --color-ink-faint: #5f6980;
+
+  --color-accent: #8b7cf6;
+  --color-accent-soft: #a596f8;
+  --color-accent-dim: #2a2450;
+
+  --color-ok: #2dd4bf;
+  --color-warn: #f5b955;
+  --color-danger: #f87171;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
+
+  --radius-panel: 14px;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-base);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* A faint grid keeps large empty areas from reading as "unfinished". */
+.app-backdrop {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(139, 124, 246, 0.09), transparent 70%),
+    linear-gradient(var(--color-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-line) 1px, transparent 1px);
+  background-size: 100% 100%, 48px 48px, 48px 48px;
+  background-position: 0 0, -1px -1px, -1px -1px;
+  opacity: 1;
+}
+
+.app-backdrop::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent, var(--color-base) 65%);
+  pointer-events: none;
+}
+
+/* ---- Scrollbars ---------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3d4759;
+  background-clip: content-box;
+}
+
+/* ---- Focus --------------------------------------------------------------- */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ---- Answer prose -------------------------------------------------------- */
+/*
+ * Scoped typography for model output. Written by hand rather than with the
+ * typography plugin: the answers are a narrow, known set of elements, and the
+ * plugin's defaults fight the inline citation pills.
+ */
+.answer {
+  font-size: 0.9375rem;
+  line-height: 1.7;
+  color: var(--color-ink);
+}
+.answer > * + * {
+  margin-top: 0.85em;
+}
+.answer h1,
+.answer h2,
+.answer h3 {
+  font-weight: 600;
+  line-height: 1.35;
+  color: #fff;
+  margin-top: 1.5em;
+}
+.answer h1 { font-size: 1.15rem; }
+.answer h2 { font-size: 1.05rem; }
+.answer h3 { font-size: 0.97rem; }
+.answer ul,
+.answer ol {
+  padding-left: 1.3em;
+}
+.answer ul { list-style: disc; }
+.answer ol { list-style: decimal; }
+.answer li + li { margin-top: 0.35em; }
+.answer li::marker { color: var(--color-ink-faint); }
+.answer a {
+  color: var(--color-accent-soft);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.answer strong { color: #fff; font-weight: 600; }
+.answer blockquote {
+  border-left: 2px solid var(--color-line-strong);
+  padding-left: 0.9em;
+  color: var(--color-ink-muted);
+}
+.answer table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+  display: block;
+  overflow-x: auto;
+}
+.answer th,
+.answer td {
+  border: 1px solid var(--color-line);
+  padding: 0.45em 0.7em;
+  text-align: left;
+}
+.answer th {
+  background: var(--color-surface-2);
+  font-weight: 600;
+}
+
+/* Inline code inside prose */
+.answer :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-surface-3);
+  border: 1px solid var(--color-line);
+  border-radius: 5px;
+  padding: 0.1em 0.36em;
+  color: #cfd6e6;
+  word-break: break-word;
+}
+
+.answer pre {
+  background: #0d1017;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+.answer pre code {
+  font-family: var(--font-mono);
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+/* ---- highlight.js theme -------------------------------------------------- */
+/*
+ * A compact custom mapping instead of importing one of highlight.js's stock
+ * stylesheets, so token colours are drawn from the same palette as the rest of
+ * the UI rather than clashing with it.
+ */
+.hljs-comment,
+.hljs-quote { color: #5f6980; font-style: italic; }
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-type { color: #c4b5fd; }
+.hljs-string,
+.hljs-regexp,
+.hljs-addition { color: #7fd8be; }
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet { color: #f5b955; }
+.hljs-title,
+.hljs-section,
+.hljs-name { color: #82c8ff; }
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable { color: #e8ecf4; }
+.hljs-built_in,
+.hljs-class .hljs-title { color: #ffc4a3; }
+.hljs-meta { color: #8fa3c7; }
+.hljs-deletion { color: #f87171; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+
+/* ---- Animations ---------------------------------------------------------- */
+@keyframes fade-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-rise {
+  animation: fade-rise 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.animate-pulse-soft {
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  100% { transform: translateX(100%); }
+}
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
+  animation: shimmer 1.8s infinite;
+}
+
+/* The streaming caret that trails generated text. */
+.caret::after {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--color-accent);
+  animation: pulse-soft 1s steps(2) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

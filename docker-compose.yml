@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: code-docs-assistant
+    ports:
+      - "3000:3000"
+    environment:
+      # Passed through from the host shell or a local .env file. Nothing
+      # secret is baked into the image.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      OPENAI_ANSWER_MODEL: ${OPENAI_ANSWER_MODEL:-gpt-4o}
+      OPENAI_UTILITY_MODEL: ${OPENAI_UTILITY_MODEL:-gpt-4o-mini}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_PATH: /data/index.db
+    volumes:
+      # The index is the only stateful thing in the system. Keeping it on a
+      # named volume means `docker compose up --build` does not throw away
+      # everything you have already indexed.
+      - index-data:/data
+    restart: unless-stopped
+
+volumes:
+  index-data:
