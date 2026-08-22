@@ -365,5 +365,54 @@ describeDb("postgres pipeline", () => {
         expect(Number(row.n), table).toBe(0);
       }
     });
+
+    it("reports whether a row was actually removed", async () => {
+      const temp = await pipeline.startIngestion({
+        sourceType: "upload",
+        sourceRef: "throwaway-twice",
+        files: [{ path: "t/src/index.ts", content: "export const answer = 42;\n" }],
+      });
+      await temp.done;
+
+      expect(await pipeline.deleteRepository(temp.id)).toBe(true);
+      // Idempotent: the route reports success either way, but the flag is what
+      // lets it tell a real delete from a repeat.
+      expect(await pipeline.deleteRepository(temp.id)).toBe(false);
+    });
+
+    /**
+     * Deleting mid-ingest is the case the UI now allows, because a job killed
+     * on serverless can leave a row stuck in `indexing` forever.
+     *
+     * The pipeline can be cancelled at two different points — a status
+     * checkpoint, or a foreign-key violation if the delete lands inside the
+     * file/chunk transaction — and which one wins is a race. So this asserts
+     * the outcome both paths must produce rather than the path taken: the
+     * background job unwinds quietly, and nothing is left behind.
+     */
+    it("cancels an in-flight ingestion rather than resurrecting it", async () => {
+      const temp = await pipeline.startIngestion({
+        sourceType: "upload",
+        sourceRef: "deleted-mid-flight",
+        files: FIXTURE_FILES,
+      });
+
+      await pipeline.deleteRepository(temp.id);
+
+      // Must resolve, not reject: a deleted repository is a normal outcome, so
+      // it has to unwind without an unhandled rejection taking the process down.
+      await expect(temp.done).resolves.toBeUndefined();
+
+      // In particular the row must not come back as `failed` — `markFailed`
+      // would be writing a status for something the user deliberately removed.
+      for (const table of ["repositories", "files", "chunks"]) {
+        const column = table === "repositories" ? "id" : "repo_id";
+        const [row] = await db.query<{ n: string }>(
+          `SELECT COUNT(*) AS n FROM ${db.tbl(table)} WHERE ${column} = $1`,
+          [temp.id],
+        );
+        expect(Number(row.n), table).toBe(0);
+      }
+    }, 120_000);
   });
 });

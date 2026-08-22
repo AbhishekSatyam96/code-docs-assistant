@@ -30,15 +30,59 @@ type GlobalWithPool = typeof globalThis & {
   [GLOBAL_KEY]?: { pool: Pool; ready: Promise<void> };
 };
 
+/**
+ * SSL modes that `pg-connection-string` currently treats as `verify-full` and
+ * warns about, because they will not keep doing so.
+ *
+ * Neon's console hands out `?sslmode=require`, and today that verifies the
+ * server certificate *and* its hostname. In pg 9 / pg-connection-string 3 these
+ * modes adopt libpq semantics, where `require` encrypts but authenticates
+ * nothing: any certificate is accepted, so an on-path attacker can present
+ * their own and read the traffic. The change is silent — same URL, same
+ * connection, no error — which is what the deprecation warning is for.
+ *
+ * Upgrading the mode says what this app already meant, and keeps meaning it
+ * across the major bump.
+ */
+const UNVERIFIED_SSL_MODES = new Set(["prefer", "require", "verify-ca"]);
+
+/**
+ * Rewrites a deprecated `sslmode` to `verify-full`.
+ *
+ * Done here rather than only in `.env` because most connection strings this
+ * app runs on are not ones we author — they come from Neon's console or a
+ * host's env var UI, and they all say `require`.
+ *
+ * A URL that does not parse is handed back untouched: the pool is a better
+ * place to learn it is malformed than this function.
+ */
+export function verifiedSslMode(connectionString: string): string {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    return connectionString;
+  }
+
+  const sslmode = url.searchParams.get("sslmode");
+  if (sslmode === null || !UNVERIFIED_SSL_MODES.has(sslmode)) return connectionString;
+
+  url.searchParams.set("sslmode", "verify-full");
+  return url.toString();
+}
+
 function createPool(): Pool {
+  const connectionString = verifiedSslMode(env().DATABASE_URL);
   const pool = new Pool({
-    connectionString: env().DATABASE_URL,
+    connectionString,
     max: 3,
     connectionTimeoutMillis: 10_000,
     idleTimeoutMillis: 30_000,
-    // Neon requires TLS. `pg` will not enable it from the URL alone unless
-    // sslmode is present, so this is belt and braces for both forms.
-    ssl: env().DATABASE_URL.includes("localhost") ? undefined : { rejectUnauthorized: true },
+    // Only reached when the URL carries no `sslmode` of its own: `pg` merges
+    // the parsed connection string *over* this config, and parsing sets `ssl`
+    // whenever `sslmode` is present. So this is the default for hosted
+    // databases whose URL omits it, not an override of the line above.
+    ssl: connectionString.includes("localhost") ? undefined : { rejectUnauthorized: true },
   });
 
   // NOTE: deliberately no `pool.on("connect")` session setup.

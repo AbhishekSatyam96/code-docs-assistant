@@ -68,6 +68,20 @@ export async function startIngestion(
   );
 
   const done = runIngestion(id, input).catch(async (error) => {
+    // A repository deleted while it was indexing is not a failure. There is no
+    // row left to mark failed, and reporting it as one would fill the logs with
+    // alarming stack traces for something the user asked for.
+    //
+    // Two shapes reach here. `IngestCancelled` is the clean one, thrown by the
+    // next status checkpoint. The other is a foreign-key violation from the
+    // file/chunk insert, if the delete lands mid-transaction — rather than
+    // pattern-match Postgres error codes, just ask whether the row still
+    // exists, which is the actual question either way.
+    if (error instanceof IngestCancelled || !(await repositoryExists(id))) {
+      logger.info("ingestion cancelled — repository was deleted", { repoId: id });
+      return;
+    }
+
     logger.error("ingestion failed", error, { repoId: id });
     const message =
       error instanceof IngestError
@@ -77,6 +91,18 @@ export async function startIngestion(
   });
 
   return { id, done };
+}
+
+/**
+ * Thrown when the repository row vanishes mid-ingest, i.e. it was deleted while
+ * indexing. Carries no user-facing message because there is nobody left to show
+ * one to — its only job is to unwind the pipeline early.
+ */
+class IngestCancelled extends Error {
+  constructor(repoId: string) {
+    super(`Repository ${repoId} was deleted during indexing`);
+    this.name = "IngestCancelled";
+  }
 }
 
 async function runIngestion(repoId: string, input: StartIngestionInput): Promise<void> {
@@ -353,18 +379,43 @@ async function writeEmbeddings(
 
 const EMBEDDING_WRITE_BATCH = 64;
 
+/**
+ * Write progress, and double as the cancellation checkpoint.
+ *
+ * `RETURNING id` turns a status write that was happening anyway into a liveness
+ * check costing nothing extra: no row back means the repository was deleted, so
+ * the pipeline stops here rather than embedding several thousand more chunks
+ * into rows that no longer exist. Since the embedding loop calls this after
+ * every window, a mid-ingest delete wastes at most one window of OpenAI spend
+ * instead of the whole repository.
+ */
 async function setStatus(
   repoId: string,
   status: string,
   detail: string,
   progress: number,
 ): Promise<void> {
-  await query(
+  const rows = await query<{ id: string }>(
     `UPDATE ${tbl("repositories")}
         SET status = $1, status_detail = $2, progress = $3, updated_at = $4
-      WHERE id = $5`,
+      WHERE id = $5
+      RETURNING id`,
     [status, detail, progress, Date.now(), repoId],
   );
+  if (rows.length === 0) throw new IngestCancelled(repoId);
+}
+
+async function repositoryExists(repoId: string): Promise<boolean> {
+  try {
+    const rows = await query(`SELECT 1 FROM ${tbl("repositories")} WHERE id = $1`, [repoId]);
+    return rows.length > 0;
+  } catch (error) {
+    // If the database itself is unreachable we cannot tell "deleted" from
+    // "cannot ask". Assume it still exists so the caller reports the real
+    // failure rather than silently swallowing it as a cancellation.
+    logger.error("could not check repository existence", error, { repoId });
+    return true;
+  }
 }
 
 async function markFailed(repoId: string, detail: string): Promise<void> {
@@ -386,8 +437,23 @@ async function markFailed(repoId: string, detail: string): Promise<void> {
  * Unlike the SQLite version this needs no manual vector cleanup: embeddings
  * are a column on `chunks` rather than a separate virtual table, so the
  * existing `ON DELETE CASCADE` reaches them.
+ *
+ * Safe to call while the repository is still indexing. The background job
+ * notices at its next status write and unwinds — see `setStatus`.
+ *
+ * Traces are deliberately *not* cascaded: `traces.repo_id` carries no foreign
+ * key, so the observability history of what was asked and what it cost survives
+ * the index it was asked against.
+ *
+ * Returns false if there was no such row, which lets the caller distinguish a
+ * genuine delete from a repeat.
  */
-export async function deleteRepository(repoId: string): Promise<void> {
-  await query(`DELETE FROM ${tbl("repositories")} WHERE id = $1`, [repoId]);
-  logger.info("repository deleted", { repoId });
+export async function deleteRepository(repoId: string): Promise<boolean> {
+  const rows = await query<{ id: string }>(
+    `DELETE FROM ${tbl("repositories")} WHERE id = $1 RETURNING id`,
+    [repoId],
+  );
+  const deleted = rows.length > 0;
+  if (deleted) logger.info("repository deleted", { repoId });
+  return deleted;
 }

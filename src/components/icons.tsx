@@ -61,10 +61,20 @@ export const CloseIcon = (p: IconProps) => (
   </Icon>
 );
 
+/**
+ * Trash can, drawn as four separate strokes rather than one combined path.
+ *
+ * The lid, handle, tapered body and two bars each stay legible at 16px, which
+ * the earlier single-path version did not: it merged the lid into the body
+ * outline, so at small sizes it read as an anonymous rounded rectangle rather
+ * than as "delete".
+ */
 export const TrashIcon = (p: IconProps) => (
   <Icon {...p}>
-    <path d="M4 7h16M10 11v6M14 11v6" />
-    <path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+    <path d="M3.5 6.5h17" />
+    <path d="M9.5 6.5V5A1.5 1.5 0 0 1 11 3.5h2A1.5 1.5 0 0 1 14.5 5v1.5" />
+    <path d="M6 6.5h12l-.9 12.6a2 2 0 0 1-2 1.9H8.9a2 2 0 0 1-2-1.9L6 6.5Z" />
+    <path d="M10 10.5v6M14 10.5v6" />
   </Icon>
 );
 

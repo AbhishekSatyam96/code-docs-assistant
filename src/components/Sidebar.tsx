@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
+
 import type { RepoSummary } from "@/lib/types";
 import { IngestPanel } from "./IngestPanel";
 import {
@@ -16,7 +18,8 @@ interface Props {
   repos: RepoSummary[];
   activeRepoId: string | null;
   onSelect: (id: string) => void;
-  onDelete: (id: string) => void;
+  /** Rejects if the delete failed, so the row can show why. */
+  onDelete: (id: string) => Promise<void>;
   onIngestStarted: (id: string) => void;
   onOpenTraces: () => void;
 }
@@ -93,14 +96,45 @@ function RepoRow({
   repo: RepoSummary;
   active: boolean;
   onSelect: () => void;
-  onDelete: () => void;
+  onDelete: () => Promise<void>;
 }) {
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const indexing = repo.status === "queued" || repo.status === "indexing";
   const SourceIcon = repo.sourceType === "github" ? GitHubIcon : FolderIcon;
 
+  const runDelete = async () => {
+    setDeleting(true);
+    setError(null);
+    try {
+      await onDelete();
+      // Deliberately not resetting `deleting` on success. The row unmounts when
+      // the refreshed list arrives, and clearing it first would flash the live
+      // row back for a frame.
+    } catch (failure) {
+      setError((failure as Error).message);
+      setDeleting(false);
+      setConfirming(false);
+    }
+  };
+
+  if (confirming || deleting) {
+    return (
+      <ConfirmDelete
+        repo={repo}
+        indexing={indexing}
+        deleting={deleting}
+        onConfirm={runDelete}
+        onCancel={() => setConfirming(false)}
+      />
+    );
+  }
+
   return (
     <div
-      className={`group relative overflow-hidden rounded-lg border transition ${
+      className={`relative overflow-hidden rounded-lg border transition ${
         active
           ? "border-accent/40 bg-accent-dim/40"
           : "border-transparent hover:border-line hover:bg-surface-2/60"
@@ -110,7 +144,11 @@ function RepoRow({
         type="button"
         onClick={onSelect}
         disabled={repo.status === "failed"}
-        className="w-full px-2.5 py-2 text-left disabled:cursor-not-allowed"
+        // `pr-10` reserves the lane the delete chip sits in (8px inset + a 28px
+        // chip). The button is always visible rather than revealed on hover:
+        // hover reveal has no equivalent on touch, and a destructive action
+        // nobody can find is the same as not having one.
+        className="w-full py-2 pr-10 pl-2.5 text-left disabled:cursor-not-allowed"
       >
         <div className="flex items-center gap-2">
           <SourceIcon
@@ -142,18 +180,102 @@ function RepoRow({
             />
           </div>
         )}
+
+        {error && (
+          <p className="mt-1 pl-5 text-[10px] leading-snug text-danger">{error}</p>
+        )}
       </button>
 
-      {!indexing && (
+      {/*
+        Shown while indexing too. Ingestion can die mid-flight on serverless and
+        leave a row stuck in `indexing` forever; hiding delete in that state made
+        exactly the rows you most want rid of the ones you could not remove.
+
+        Drawn as a bordered chip rather than a bare glyph. `text-ink-faint` is a
+        ~1.9:1 contrast against these surfaces — under the 3:1 WCAG floor for
+        interactive controls — so a faint 14px outline icon was invisible in
+        practice even though it was in the DOM. `ink-muted` on its own surface
+        clears 6:1 and reads as a button rather than as decoration.
+      */}
+      <button
+        type="button"
+        onClick={() => setConfirming(true)}
+        aria-label={indexing ? `Stop indexing and delete ${repo.name}` : `Delete ${repo.name}`}
+        title={indexing ? "Stop indexing and delete" : "Delete"}
+        className="absolute top-1/2 right-2 -translate-y-1/2 rounded-md border border-line bg-surface-2 p-1.5 text-ink-muted transition hover:border-danger/50 hover:bg-danger/15 hover:text-danger focus-visible:ring-1 focus-visible:ring-danger/60 focus-visible:outline-none"
+      >
+        <TrashIcon className="h-4 w-4" strokeWidth={1.7} />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Two-step confirmation, inline rather than `window.confirm`.
+ *
+ * A native dialog would be one line, but it cannot say *what* is being lost —
+ * and the cost here is not obvious from the row: deleting drops every chunk and
+ * embedding, so getting the repository back means paying to re-embed it.
+ */
+function ConfirmDelete({
+  repo,
+  indexing,
+  deleting,
+  onConfirm,
+  onCancel,
+}: {
+  repo: RepoSummary;
+  indexing: boolean;
+  deleting: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+
+  // Focus the destructive button so the confirmation is reachable without a
+  // mouse, and so Escape below has somewhere to fire from.
+  useEffect(() => {
+    confirmRef.current?.focus();
+  }, []);
+
+  return (
+    <div
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && !deleting) {
+          event.stopPropagation();
+          onCancel();
+        }
+      }}
+      className="rounded-lg border border-danger/40 bg-danger/10 px-2.5 py-2"
+    >
+      <p className="text-[11px] leading-snug text-ink">
+        Delete <span className="font-medium break-all">{repo.name}</span>?
+      </p>
+      <p className="mt-0.5 text-[10px] leading-snug text-ink-faint">
+        {indexing
+          ? "Indexing stops and nothing is kept."
+          : `${repo.chunkCount.toLocaleString()} chunks are removed. Re-indexing costs another embedding run.`}
+      </p>
+
+      <div className="mt-2 flex gap-1.5">
+        <button
+          ref={confirmRef}
+          type="button"
+          onClick={onConfirm}
+          disabled={deleting}
+          className="rounded bg-danger/20 px-2 py-1 text-[11px] font-medium text-danger transition hover:bg-danger/30 focus-visible:ring-1 focus-visible:ring-danger/60 focus-visible:outline-none disabled:opacity-60"
+        >
+          {deleting ? "Deleting…" : "Delete"}
+        </button>
         <button
           type="button"
-          onClick={onDelete}
-          aria-label={`Delete ${repo.name}`}
-          className="absolute right-1.5 top-1.5 rounded p-1 text-ink-faint opacity-0 transition hover:bg-danger/15 hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
+          onClick={onCancel}
+          disabled={deleting}
+          className="rounded px-2 py-1 text-[11px] text-ink-muted transition hover:bg-surface-2 hover:text-ink focus-visible:ring-1 focus-visible:ring-line focus-visible:outline-none disabled:opacity-60"
         >
-          <TrashIcon className="h-3 w-3" />
+          Cancel
         </button>
-      )}
+      </div>
     </div>
   );
 }

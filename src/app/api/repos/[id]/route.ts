@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { query, tbl } from "@/lib/db";
 import { deleteRepository } from "@/lib/ingest/pipeline";
 import type { RepoMap } from "@/lib/ingest/repo-map";
+import { logger } from "@/lib/observability/logger";
 
 export const dynamic = "force-dynamic";
 
@@ -58,8 +59,21 @@ export async function GET(_request: Request, context: Context) {
   });
 }
 
+/**
+ * Idempotent by design: deleting an id that is already gone reports success
+ * rather than 404. The client removes the row optimistically and a poll can
+ * refresh underneath it, so "not found" here means the user's intent was
+ * already satisfied — surfacing it as an error would just be a spurious red
+ * banner on a row that is correctly gone.
+ */
 export async function DELETE(_request: Request, context: Context) {
   const { id } = await context.params;
-  await deleteRepository(id);
-  return NextResponse.json({ ok: true });
+
+  try {
+    const deleted = await deleteRepository(id);
+    return NextResponse.json({ ok: true, deleted });
+  } catch (error) {
+    logger.error("failed to delete repository", error, { repoId: id });
+    return NextResponse.json({ error: "Could not delete this repository." }, { status: 500 });
+  }
 }
